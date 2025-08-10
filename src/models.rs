@@ -1,8 +1,6 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-// Estruturas de payload de entrada/saída
-
 #[derive(Debug, Deserialize)]
 pub struct PaymentIn {
     #[serde(rename = "correlationId")]
@@ -28,6 +26,8 @@ pub struct JobPayload {
     pub requested_at: String,
     #[serde(default)]
     pub attempts: u32,
+    #[serde(default, rename = "proc", skip_serializing_if = "Option::is_none")]
+    pub proc_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

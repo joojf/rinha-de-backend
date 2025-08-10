@@ -1,6 +1,3 @@
-// Biblioteca principal: expõe start() para inicializar servidor
-// Comentários em pt-BR conforme diretrizes
-
 mod background;
 mod config;
 mod models;
@@ -12,7 +9,6 @@ mod timeutil;
 pub use crate::config::Config;
 pub use crate::state::AppState;
 
-// Inicia health-checkers, worker, constrói o router e inicia o servidor
 pub async fn start() -> anyhow::Result<()> {
     use axum::Router;
     use tokio::net::TcpListener;

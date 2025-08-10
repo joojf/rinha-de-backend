@@ -63,10 +63,22 @@ pub fn spawn_worker(state: AppState) {
             match res {
                 Ok(Some((_k, val))) => {
                     if let Ok(mut job) = serde_json::from_str::<JobPayload>(&val) {
-                        let proc_choice = choose_target(&state).await;
-                        let (proc_name, base) = match proc_choice {
-                            ProcChoice::Default => ("default", state.default_base.clone()),
-                            ProcChoice::Fallback => ("fallback", state.fallback_base.clone()),
+                        // Fixa o processador escolhido por job para evitar duplo processamento em serviços distintos
+                        let proc = if let Some(ref p) = job.proc_name {
+                            p.as_str()
+                        } else {
+                            let choice = choose_target(&state).await;
+                            let p = match choice {
+                                ProcChoice::Default => "default",
+                                ProcChoice::Fallback => "fallback",
+                            };
+                            job.proc_name = Some(p.to_string());
+                            p
+                        };
+                        let (proc_name, base) = if proc == "default" {
+                            ("default", state.default_base.clone())
+                        } else {
+                            ("fallback", state.fallback_base.clone())
                         };
                         let to = compute_timeout(&state, proc_name).await;
                         let url = format!("{}/payments", base);
@@ -76,10 +88,46 @@ pub fn spawn_worker(state: AppState) {
                             requested_at: job.requested_at.clone(),
                         });
                         let resp = req.send().await;
-                        let success = matches!(&resp, Ok(r) if r.status().is_success());
+                        let mut success = match &resp {
+                            Ok(r) if r.status().is_success() => true,
+                            Ok(r) if r.status().as_u16() == 409 => true, // já processado no processor
+                            _ => false,
+                        };
+                        let _http_code = resp.as_ref().map(|r| r.status().as_u16()).unwrap_or(0);
+                        // Se falhou ou expirou, tenta confirmar no processor via GET /payments/{id}
+                        if !success {
+                            let det_url = format!("{}/payments/{}", base, job.correlation_id);
+                            let det = state
+                                .http
+                                .get(&det_url)
+                                .timeout(Duration::from_millis(300))
+                                .send()
+                                .await;
+                            if let Ok(r) = det {
+                                if r.status().is_success() {
+                                    // Considera como processado: registra localmente e evita retry
+                                    let now = crate::timeutil::parse_rfc3339(&job.requested_at)
+                                        .unwrap_or_else(Utc::now);
+                                    if let Err(e) = record_event(
+                                        &mut redis_mgr,
+                                        proc_name,
+                                        now,
+                                        &job.correlation_id,
+                                        job.amount,
+                                    )
+                                    .await
+                                    {
+                                        eprintln!("erro registrando evento (confirm): {}", e);
+                                    }
+                                    success = true;
+                                }
+                            }
+                        }
                         update_circuit_after(&state, proc_name, success).await;
                         if success {
-                            let now = Utc::now();
+                            // Alinhar timestamp com o usado pelo processor (requestedAt)
+                            let now = crate::timeutil::parse_rfc3339(&job.requested_at)
+                                .unwrap_or_else(Utc::now);
                             if let Err(e) = record_event(
                                 &mut redis_mgr,
                                 proc_name,

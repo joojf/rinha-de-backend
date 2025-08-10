@@ -25,6 +25,10 @@ pub struct AppState {
     pub max_retries: u32,
     pub retry_backoff: Duration,
     pub timeout_margin: Duration,
+    pub debug: bool,
+    pub trace_txns: bool,
+    pub diag_compare: bool,
+    pub admin_token: String,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -98,6 +102,10 @@ pub async fn build_state(cfg: &Config) -> anyhow::Result<AppState> {
         max_retries: cfg.max_retries,
         retry_backoff: cfg.retry_backoff,
         timeout_margin: cfg.timeout_margin,
+        debug: cfg.debug,
+        trace_txns: cfg.trace_txns,
+        diag_compare: cfg.diag_compare,
+        admin_token: cfg.admin_token.clone(),
     })
 }
 
@@ -167,10 +175,13 @@ pub async fn compute_timeout(state: &AppState, proc_name: &str) -> Duration {
         )
     };
     if let (Some(false), Some(ms)) = (failing, min_rt) {
-        // Ajuste: usar o minResponseTime + margem para evitar timeouts prematuros
-        // mínimo absoluto de 20ms
-        let base = (ms + state.timeout_margin.as_millis() as u64).max(20);
-        Duration::from_millis(base)
+        // Ajuste: usar minResponseTime + margem, garantindo um piso razoável e respeitando req_timeout
+        let mut base = ms + state.timeout_margin.as_millis() as u64;
+        if base < 200 {
+            base = 200;
+        }
+        let to = base.max(state.req_timeout.as_millis() as u64);
+        Duration::from_millis(to)
     } else {
         state.req_timeout
     }

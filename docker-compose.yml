@@ -8,8 +8,9 @@ services:
       - DEFAULT_URL=http://payment-processor-default:8080
       - FALLBACK_URL=http://payment-processor-fallback:8080
       - REDIS_URL=redis://redis:6379
-      - REQ_TIMEOUT_MS=120
+      - REQ_TIMEOUT_MS=1200
       - WORKERS=32
+      - DEBUG=1
     depends_on:
       - redis
     networks:
@@ -28,8 +29,9 @@ services:
       - DEFAULT_URL=http://payment-processor-default:8080
       - FALLBACK_URL=http://payment-processor-fallback:8080
       - REDIS_URL=redis://redis:6379
-      - REQ_TIMEOUT_MS=120
+      - REQ_TIMEOUT_MS=1200
       - WORKERS=32
+      - DEBUG=1
     depends_on:
       - redis
     networks:

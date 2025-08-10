@@ -56,8 +56,9 @@ async fn handle_payment(
     let job = JobPayload {
         correlation_id: input.correlation_id,
         amount: input.amount,
-        requested_at: now_str,
+        requested_at: now_str.clone(),
         attempts: 0,
+        proc_name: None,
     };
     let job_json = serde_json::to_string(&job).map_err(anyhow::Error::from)?;
     let _: () = redis
@@ -93,11 +94,12 @@ async fn handle_summary(
         q.to.as_deref()
             .and_then(parse_rfc3339)
             .unwrap_or(DateTime::<Utc>::MAX_UTC);
-    let (from_s, to_s) = (from.timestamp(), to.timestamp());
-    if to_s < from_s {
+    let (from_ms, to_ms) = (from.timestamp_millis(), to.timestamp_millis());
+    if to_ms < from_ms {
         return Ok((StatusCode::OK, Json(SummaryOut::default())));
     }
-    let default = sum_range(&mut redis, "default", from_s, to_s).await?;
-    let fallback = sum_range(&mut redis, "fallback", from_s, to_s).await?;
+    let default = sum_range(&mut redis, "default", from_ms, to_ms).await?;
+    let fallback = sum_range(&mut redis, "fallback", from_ms, to_ms).await?;
+
     Ok((StatusCode::OK, Json(SummaryOut { default, fallback })))
 }

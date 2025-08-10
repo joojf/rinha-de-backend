@@ -17,6 +17,10 @@ pub struct Config {
     pub retry_backoff: Duration,
     pub timeout_margin: Duration,
     pub workers: usize,
+    pub debug: bool,
+    pub trace_txns: bool,
+    pub diag_compare: bool,
+    pub admin_token: String,
 }
 
 impl Config {
@@ -67,6 +71,20 @@ impl Config {
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(32);
+        let debug = std::env::var("DEBUG")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "True"))
+            .unwrap_or(false);
+        // Flag específico para reduzir ruído: logs por transação (API/worker)
+        // Mantém DEBUG para logs de saúde e sumário
+        let trace_txns = std::env::var("TRACE_TXNS")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "True"))
+            .unwrap_or(false);
+        // Quando ativo, o handler de summary consulta os dois admin/payments-summary
+        // e loga os deltas para facilitar diagnóstico de inconsistência.
+        let diag_compare = std::env::var("DIAG_COMPARE")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "True"))
+            .unwrap_or(true);
+        let admin_token = std::env::var("ADMIN_TOKEN").unwrap_or_else(|_| "123".to_string());
 
         Ok(Self {
             bind_addr,
@@ -82,6 +100,10 @@ impl Config {
             retry_backoff,
             timeout_margin,
             workers,
+            debug,
+            trace_txns,
+            diag_compare,
+            admin_token,
         })
     }
 }
