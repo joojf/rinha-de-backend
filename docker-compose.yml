@@ -2,8 +2,7 @@ version: "3.9"
 
 services:
   app1:
-    build: .
-    image: rinha-rust-app:latest
+    image: ghcr.io/joojf/rinha-de-backend:latest
     environment:
       - BIND_ADDR=0.0.0.0:9999
       - DEFAULT_URL=http://payment-processor-default:8080
@@ -22,8 +21,7 @@ services:
           memory: "110MB"
 
   app2:
-    image: rinha-rust-app:latest
-    build: .
+    image: ghcr.io/joojf/rinha-de-backend:latest
     environment:
       - BIND_ADDR=0.0.0.0:9999
       - DEFAULT_URL=http://payment-processor-default:8080
