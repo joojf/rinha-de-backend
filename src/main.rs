@@ -34,6 +34,17 @@ struct ProcessorPayment<'a> {
     requested_at: String,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct JobPayload {
+    #[serde(rename = "correlationId")]
+    correlation_id: Uuid,
+    amount: f64,
+    #[serde(rename = "requestedAt")]
+    requested_at: String,
+    #[serde(default)]
+    attempts: u32,
+}
+
 #[derive(Clone)]
 struct AppState {
     http: Client,
@@ -45,6 +56,11 @@ struct AppState {
     health: Arc<RwLock<HealthState>>,
     cb_fail_threshold: u32,
     cb_open_duration: Duration,
+    queue_key: String,
+    idemp_ttl: u64,
+    max_retries: u32,
+    retry_backoff: Duration,
+    timeout_margin: Duration,
 }
 
 #[derive(Debug, Deserialize)]
@@ -151,6 +167,25 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|v| v.parse::<u64>().ok())
         .map(Duration::from_millis)
         .unwrap_or(Duration::from_millis(1500));
+    let queue_key = std::env::var("QUEUE_KEY").unwrap_or_else(|_| "q:payments".to_string());
+    let idemp_ttl = std::env::var("IDEMP_TTL_SEC")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(24 * 60 * 60);
+    let max_retries = std::env::var("MAX_RETRIES")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(3);
+    let retry_backoff = std::env::var("RETRY_BACKOFF_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::from_millis(100));
+    let timeout_margin = std::env::var("TIMEOUT_MARGIN_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::from_millis(5));
 
     let http = Client::builder()
         .http1_only()
@@ -171,11 +206,19 @@ async fn main() -> anyhow::Result<()> {
         health: Arc::new(RwLock::new(HealthState::default())),
         cb_fail_threshold,
         cb_open_duration,
+        queue_key: queue_key.clone(),
+        idemp_ttl,
+        max_retries,
+        retry_backoff,
+        timeout_margin,
     };
 
     // Inicia health-checkers em background (1 chamada a cada 5s por serviço)
     spawn_health_checker(state.clone(), true);
     spawn_health_checker(state.clone(), false);
+
+    // Inicia worker consumidor de fila
+    spawn_worker(state.clone());
 
     let app = Router::new()
         .route("/payments", post(handle_payment))
@@ -204,10 +247,18 @@ async fn handle_payment(
     // idempotência pelo correlationId
     let mut redis = state.redis.clone();
     let corr_key = format!("corr:{}", input.correlation_id);
-    let inserted: bool = redis
-        .set_nx(&corr_key, 1)
+    // Usa SET NX EX (uma ida só)
+    // SET key 1 NX EX idemp_ttl
+    let set_res: Option<String> = redis::cmd("SET")
+        .arg(&corr_key)
+        .arg(1)
+        .arg("NX")
+        .arg("EX")
+        .arg(state.idemp_ttl)
+        .query_async(&mut redis)
         .await
         .map_err(anyhow::Error::from)?;
+    let inserted = set_res.is_some();
     if !inserted {
         // já processado; não reencaminha e responde OK
         return Ok((
@@ -215,39 +266,23 @@ async fn handle_payment(
             Json(serde_json::json!({"status":"duplicate"})),
         ));
     }
-    // manter por um tempo razoável (12h)
+    // Enfileira o job e responde 202 imediatamente
+    let job = JobPayload {
+        correlation_id: input.correlation_id,
+        amount: input.amount,
+        requested_at: now_str,
+        attempts: 0,
+    };
+    let job_json = serde_json::to_string(&job).map_err(anyhow::Error::from)?;
     let _: () = redis
-        .expire(&corr_key, 60 * 60 * 12)
+        .lpush(&state.queue_key, job_json)
         .await
         .map_err(anyhow::Error::from)?;
 
-    let payload = ProcessorPayment {
-        correlation_id: &input.correlation_id,
-        amount: input.amount,
-        requested_at: now_str,
-    };
-
-    // decisão com base no health + circuit breaker
-    let target = choose_target(&state).await;
-    let (proc_name, url) = match target {
-        ProcChoice::Default => ("default", format!("{}/payments", state.default_base)),
-        ProcChoice::Fallback => ("fallback", format!("{}/payments", state.fallback_base)),
-        ProcChoice::None => ("default", format!("{}/payments", state.default_base)),
-    };
-
-    let resp = state.http.post(&url).json(&payload).send().await;
-    let success = matches!(&resp, Ok(r) if r.status().is_success());
-    update_circuit_after(&state, proc_name, success).await;
-
-    if success {
-        update_counters(&mut redis, proc_name, now, input.amount).await?;
-        return Ok((
-            StatusCode::ACCEPTED,
-            Json(serde_json::json!({"status":"ok","processor":proc_name})),
-        ));
-    }
-
-    Err(AppError::Unavailable)
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({"status":"queued"})),
+    ))
 }
 
 // GET /payments-summary
@@ -339,33 +374,49 @@ async fn sum_range(
     from_s: i64,
     to_s: i64,
 ) -> Result<SummarySide, AppError> {
-    // varre em blocos para limitar roundtrips
-    const SLICE: i64 = 200; // segundos por lote
-    let mut total_count: u64 = 0;
+    // Janelas exatas em milissegundos usando ZSET + HASH
+    let key_z = format!("pay:{}", proc_name);
+    let from_ms = from_s.saturating_mul(1000);
+    let to_ms = to_s.saturating_mul(1000);
+
+    // totalRequests via ZCOUNT
+    let count_in_range: i64 = redis
+        .zcount(&key_z, from_ms, to_ms)
+        .await
+        .map_err(anyhow::Error::from)?;
+
+    // Busca IDs em blocos e soma amounts via HASH
     let mut total_amount: f64 = 0.0;
-    let mut cur = from_s;
-    while cur <= to_s {
-        let end = (cur + SLICE - 1).min(to_s);
-        let mut keys_count = Vec::with_capacity((end - cur + 1) as usize);
-        let mut keys_amount = Vec::with_capacity((end - cur + 1) as usize);
-        for s in cur..=end {
-            keys_count.push(format!("summary:{}:{}:count", proc_name, s));
-            keys_amount.push(format!("summary:{}:{}:amount", proc_name, s));
+    let mut cursor = from_ms;
+    const CHUNK: isize = 512;
+    loop {
+        let ids: Vec<String> = redis
+            .zrangebyscore_limit(&key_z, cursor, to_ms, 0, CHUNK)
+            .await
+            .map_err(anyhow::Error::from)?;
+        if ids.is_empty() {
+            break;
         }
-        // MGET counts
-        let counts: Vec<Option<i64>> = redis.mget(keys_count).await.map_err(anyhow::Error::from)?;
-        let amounts: Vec<Option<f64>> =
-            redis.mget(keys_amount).await.map_err(anyhow::Error::from)?;
-        for c in counts.into_iter().flatten() {
-            total_count = total_count.saturating_add(c as u64);
-        }
-        for a in amounts.into_iter().flatten() {
+        let amts: Vec<Option<f64>> = redis
+            .hget("payamt", &ids)
+            .await
+            .map_err(anyhow::Error::from)?;
+        for a in amts.into_iter().flatten() {
             total_amount += a;
         }
-        cur = end + 1;
+        // avança cursor usando o último elemento
+        if let Some(last_id) = ids.last() {
+            let score: Result<f64, _> = redis.zscore(&key_z, last_id).await;
+            match score {
+                Ok(s) => cursor = (s as i64) + 1,
+                Err(_) => break,
+            }
+        } else {
+            break;
+        }
     }
     Ok(SummarySide {
-        total_requests: total_count,
+        total_requests: count_in_range as u64,
         total_amount,
     })
 }
@@ -475,4 +526,131 @@ fn spawn_health_checker(state: AppState, is_default: bool) {
             }
         }
     });
+}
+
+// Worker que consome a fila do Redis e processa pagamentos
+fn spawn_worker(state: AppState) {
+    tokio::spawn(async move {
+        let queue = state.queue_key.clone();
+        let mut redis = state.redis.clone();
+        loop {
+            // BRPOP com timeout curto
+            let res: redis::RedisResult<Option<(String, String)>> = redis.brpop(&queue, 1.0).await;
+            match res {
+                Ok(Some((_k, val))) => {
+                    if let Ok(mut job) = serde_json::from_str::<JobPayload>(&val) {
+                        let proc_choice = choose_target(&state).await;
+                        let (proc_name, base) = match proc_choice {
+                            ProcChoice::Default => ("default", state.default_base.clone()),
+                            ProcChoice::Fallback => ("fallback", state.fallback_base.clone()),
+                            ProcChoice::None => ("default", state.default_base.clone()),
+                        };
+
+                        // Timeout adaptativo baseado no health
+                        let to = compute_timeout(&state, proc_name).await;
+                        let url = format!("{}/payments", base);
+                        let req = state.http.post(&url).timeout(to).json(&ProcessorPayment {
+                            correlation_id: &job.correlation_id,
+                            amount: job.amount,
+                            requested_at: job.requested_at.clone(),
+                        });
+                        let resp = req.send().await;
+                        let success = matches!(&resp, Ok(r) if r.status().is_success());
+                        update_circuit_after(&state, proc_name, success).await;
+                        if success {
+                            // registra evento exato e totais
+                            let now = Utc::now();
+                            if let Err(e) = record_event(
+                                &mut redis,
+                                proc_name,
+                                now,
+                                &job.correlation_id,
+                                job.amount,
+                            )
+                            .await
+                            {
+                                eprintln!("erro registrando evento: {}", e);
+                            }
+                        } else {
+                            // retry com backoff e limite
+                            job.attempts = job.attempts.saturating_add(1);
+                            if job.attempts <= state.max_retries {
+                                tokio::time::sleep(state.retry_backoff).await;
+                                if let Ok(s) = serde_json::to_string(&job) {
+                                    let _: Result<(), _> = redis.lpush(&queue, s).await;
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(None) => {
+                    // timeout sem itens
+                }
+                Err(err) => {
+                    eprintln!("erro na fila: {}", err);
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        }
+    });
+}
+
+async fn record_event(
+    redis: &mut ConnectionManager,
+    proc_name: &str,
+    ts: DateTime<Utc>,
+    correlation_id: &Uuid,
+    amount: f64,
+) -> Result<(), AppError> {
+    // ZSET por processador e HASH global de amounts
+    let key_z = format!("pay:{}", proc_name);
+    let epoch_ms = ts.timestamp_millis();
+    let id = correlation_id.to_string();
+
+    let mut pipe = redis::pipe();
+    pipe.atomic()
+        .cmd("ZADD")
+        .arg(&key_z)
+        .arg(epoch_ms)
+        .arg(&id)
+        .ignore()
+        .cmd("HSETNX")
+        .arg("payamt")
+        .arg(&id)
+        .arg(amount)
+        .ignore();
+    // Totais agregados mantidos para consultas sem janela
+    let total_count = format!("summary:{}:total_count", proc_name);
+    let total_amount = format!("summary:{}:total_amount", proc_name);
+    pipe.incr(&total_count, 1)
+        .ignore()
+        .cmd("INCRBYFLOAT")
+        .arg(&total_amount)
+        .arg(amount)
+        .ignore();
+    let _: () = pipe.query_async(redis).await.map_err(anyhow::Error::from)?;
+    Ok(())
+}
+
+async fn compute_timeout(state: &AppState, proc_name: &str) -> Duration {
+    let hs = state.health.read().await;
+    let (failing, min_rt) = if proc_name == "default" {
+        (
+            hs.default.health.failing,
+            hs.default.health.min_response_time_ms,
+        )
+    } else {
+        (
+            hs.fallback.health.failing,
+            hs.fallback.health.min_response_time_ms,
+        )
+    };
+    if let (Some(false), Some(ms)) = (failing, min_rt) {
+        let base = ms
+            .saturating_sub(state.timeout_margin.as_millis() as u64)
+            .max(20);
+        Duration::from_millis(base)
+    } else {
+        state.req_timeout
+    }
 }
