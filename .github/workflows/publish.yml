@@ -45,10 +45,6 @@ jobs:
           echo "version=$VERS" >> $GITHUB_OUTPUT
           echo "publish=$PUB" >> $GITHUB_OUTPUT
 
-      - name: Set up QEMU
-        if: steps.meta.outputs.publish == 'true'
-        uses: docker/setup-qemu-action@v3
-
       - name: Set up Docker Buildx
         if: steps.meta.outputs.publish == 'true'
         uses: docker/setup-buildx-action@v3
@@ -61,14 +57,14 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push (multi-arch)
+      - name: Build and push (amd64)
         if: steps.meta.outputs.publish == 'true'
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
           push: true
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64
           tags: |
             ghcr.io/joojf/rinha-de-backend:${{ steps.meta.outputs.version }}
             ghcr.io/joojf/rinha-de-backend:latest
