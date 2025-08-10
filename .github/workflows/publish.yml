@@ -6,6 +6,8 @@ on:
     paths:
       - Cargo.toml
       - Dockerfile
+    tags:
+      - 'v*'
 
 permissions:
   contents: read
@@ -18,40 +20,37 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Detect version increase
-        id: calc
+      - name: Compute version/publish condition
+        id: meta
         run: |
           set -euo pipefail
-          BEFORE="${{ github.event.before }}"
-          NEW_VERSION=$(sed -n 's/^version\s*=\s*"\([^"]\+\)"/\1/p' Cargo.toml | head -n1)
-          if git show "$BEFORE":Cargo.toml >/tmp/old.toml 2>/dev/null; then
-            OLD_VERSION=$(sed -n 's/^version\s*=\s*"\([^"]\+\)"/\1/p' /tmp/old.toml | head -n1)
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            RAW="${{ github.ref_name }}"; VERS="${RAW#v}"; PUB=true
           else
-            OLD_VERSION=""
-          fi
-          parse() {
-            IFS='.' read -r MA MI PA <<< "$1"; MA=${MA:-0}; MI=${MI:-0}; PA=${PA:-0}; echo "$MA $MI $PA";
-          }
-          if [ -z "$OLD_VERSION" ]; then
-            INCREASED=true
-          else
-            read OMA OMI OPA < <(parse "$OLD_VERSION")
-            read NMA NMI NPA < <(parse "$NEW_VERSION")
-            if [ "$NMA" -gt "$OMA" ] || { [ "$NMA" -eq "$OMA" ] && [ "$NMI" -gt "$OMI" ]; } || { [ "$NMA" -eq "$OMA" ] && [ "$NMI" -eq "$OMI" ] && [ "$NPA" -gt "$OPA" ]; }; then
-              INCREASED=true
+            BEFORE="${{ github.event.before }}"
+            VERS=$(sed -n 's/^version\s*=\s*"\([^"]\+\)"/\1/p' Cargo.toml | head -n1)
+            if git show "$BEFORE":Cargo.toml >/tmp/old.toml 2>/dev/null; then
+              OLD=$(sed -n 's/^version\s*=\s*"\([^"]\+\)"/\1/p' /tmp/old.toml | head -n1)
             else
-              INCREASED=false
+              OLD=""
+            fi
+            parse() { IFS='.' read -r A B C <<< "$1"; echo "${A:-0} ${B:-0} ${C:-0}"; }
+            if [ -z "$OLD" ]; then PUB=true; else
+              read OA OB OC < <(parse "$OLD"); read NA NB NC < <(parse "$VERS")
+              if [ "$NA" -gt "$OA" ] || { [ "$NA" -eq "$OA" ] && [ "$NB" -gt "$OB" ]; } || { [ "$NA" -eq "$OA" ] && [ "$NB" -eq "$OB" ] && [ "$NC" -gt "$OC" ]; }; then
+                PUB=true
+              else PUB=false; fi
             fi
           fi
-          echo "version=$NEW_VERSION" >> $GITHUB_OUTPUT
-          echo "version_increased=$INCREASED" >> $GITHUB_OUTPUT
+          echo "version=$VERS" >> $GITHUB_OUTPUT
+          echo "publish=$PUB" >> $GITHUB_OUTPUT
 
       - name: Set up Docker Buildx
-        if: steps.calc.outputs.version_increased == 'true'
+        if: steps.meta.outputs.publish == 'true'
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR
-        if: steps.calc.outputs.version_increased == 'true'
+        if: steps.meta.outputs.publish == 'true'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -59,7 +58,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push (linux/amd64)
-        if: steps.calc.outputs.version_increased == 'true'
+        if: steps.meta.outputs.publish == 'true'
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -67,7 +66,7 @@ jobs:
           push: true
           platforms: linux/amd64
           tags: |
-            ghcr.io/joojf/rinha-de-backend:${{ steps.calc.outputs.version }}
+            ghcr.io/joojf/rinha-de-backend:${{ steps.meta.outputs.version }}
             ghcr.io/joojf/rinha-de-backend:latest
           labels: |
             org.opencontainers.image.source=${{ github.repository }}
