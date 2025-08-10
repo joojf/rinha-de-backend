@@ -1,6 +1,7 @@
 use std::{sync::Arc, time::Duration};
 
 use crate::config::Config;
+use redis::Client as RedisClient;
 use redis::aio::ConnectionManager;
 use reqwest::Client;
 use thiserror::Error;
@@ -12,6 +13,7 @@ use tokio::time::Instant;
 pub struct AppState {
     pub http: Client,
     pub redis: ConnectionManager,
+    pub redis_client: RedisClient,
     pub default_base: String,
     pub fallback_base: String,
     pub req_timeout: Duration,
@@ -54,10 +56,6 @@ pub struct Circuit {
 pub enum AppError {
     #[error("invalid amount")]
     InvalidAmount,
-    #[error("duplicate correlation id")]
-    Duplicate,
-    #[error("processors unavailable")]
-    Unavailable,
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
@@ -67,8 +65,6 @@ impl axum::response::IntoResponse for AppError {
         use axum::{Json, http::StatusCode};
         let code = match self {
             AppError::InvalidAmount => StatusCode::BAD_REQUEST,
-            AppError::Duplicate => StatusCode::OK,
-            AppError::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
             AppError::Other(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         (code, Json(serde_json::json!({ "error": self.to_string() }))).into_response()
@@ -78,17 +74,19 @@ impl axum::response::IntoResponse for AppError {
 pub async fn build_state(cfg: &Config) -> anyhow::Result<AppState> {
     let http = Client::builder()
         .http1_only()
+        .pool_max_idle_per_host(64)
         .pool_idle_timeout(Duration::from_secs(10))
         .tcp_keepalive(Duration::from_secs(30))
         .timeout(cfg.req_timeout)
         .build()?;
 
     let client = redis::Client::open(cfg.redis_url.clone())?;
-    let manager = ConnectionManager::new(client).await?;
+    let manager = ConnectionManager::new(client.clone()).await?;
 
     Ok(AppState {
         http,
         redis: manager,
+        redis_client: client,
         default_base: cfg.default_base.clone(),
         fallback_base: cfg.fallback_base.clone(),
         req_timeout: cfg.req_timeout,
@@ -107,7 +105,6 @@ pub async fn build_state(cfg: &Config) -> anyhow::Result<AppState> {
 pub enum ProcChoice {
     Default,
     Fallback,
-    None,
 }
 
 pub async fn choose_target(state: &AppState) -> ProcChoice {
@@ -170,9 +167,9 @@ pub async fn compute_timeout(state: &AppState, proc_name: &str) -> Duration {
         )
     };
     if let (Some(false), Some(ms)) = (failing, min_rt) {
-        let base = ms
-            .saturating_sub(state.timeout_margin.as_millis() as u64)
-            .max(20);
+        // Ajuste: usar o minResponseTime + margem para evitar timeouts prematuros
+        // mínimo absoluto de 20ms
+        let base = (ms + state.timeout_margin.as_millis() as u64).max(20);
         Duration::from_millis(base)
     } else {
         state.req_timeout

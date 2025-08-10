@@ -7,35 +7,7 @@ use crate::models::SummarySide;
 use crate::state::AppError;
 
 // Atualiza contadores no Redis: bucket por segundo e totais
-pub async fn update_counters(
-    redis: &mut ConnectionManager,
-    proc_name: &str,
-    ts: DateTime<Utc>,
-    amount: f64,
-) -> Result<(), AppError> {
-    let sec = ts.timestamp();
-    let bucket_count = format!("summary:{}:{}:count", proc_name, sec);
-    let bucket_amount = format!("summary:{}:{}:amount", proc_name, sec);
-    let total_count = format!("summary:{}:total_count", proc_name);
-    let total_amount = format!("summary:{}:total_amount", proc_name);
-
-    let mut pipe = redis::pipe();
-    pipe.atomic()
-        .incr(&bucket_count, 1)
-        .ignore()
-        .incr(&total_count, 1)
-        .ignore()
-        .cmd("INCRBYFLOAT")
-        .arg(&bucket_amount)
-        .arg(amount)
-        .ignore()
-        .cmd("INCRBYFLOAT")
-        .arg(&total_amount)
-        .arg(amount)
-        .ignore();
-    let _: () = pipe.query_async(redis).await.map_err(anyhow::Error::from)?;
-    Ok(())
-}
+// função removida: não estava em uso
 
 pub async fn read_totals(
     redis: &mut ConnectionManager,

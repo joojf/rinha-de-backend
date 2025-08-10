@@ -9,6 +9,7 @@ services:
       - FALLBACK_URL=http://payment-processor-fallback:8080
       - REDIS_URL=redis://redis:6379
       - REQ_TIMEOUT_MS=120
+      - WORKERS=32
     depends_on:
       - redis
     networks:
@@ -28,6 +29,7 @@ services:
       - FALLBACK_URL=http://payment-processor-fallback:8080
       - REDIS_URL=redis://redis:6379
       - REQ_TIMEOUT_MS=120
+      - WORKERS=32
     depends_on:
       - redis
     networks:

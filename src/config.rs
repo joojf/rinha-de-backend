@@ -16,6 +16,7 @@ pub struct Config {
     pub max_retries: u32,
     pub retry_backoff: Duration,
     pub timeout_margin: Duration,
+    pub workers: usize,
 }
 
 impl Config {
@@ -62,6 +63,10 @@ impl Config {
             .and_then(|v| v.parse::<u64>().ok())
             .map(Duration::from_millis)
             .unwrap_or(Duration::from_millis(5));
+        let workers = std::env::var("WORKERS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(32);
 
         Ok(Self {
             bind_addr,
@@ -76,6 +81,7 @@ impl Config {
             max_retries,
             retry_backoff,
             timeout_margin,
+            workers,
         })
     }
 }

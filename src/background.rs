@@ -46,10 +46,20 @@ pub fn spawn_health_checker(state: AppState, is_default: bool) {
 // Worker que consome a fila do Redis e processa pagamentos
 pub fn spawn_worker(state: AppState) {
     tokio::spawn(async move {
+        // Conexão dedicada para operações bloqueantes (BLPOP)
         let queue = state.queue_key.clone();
-        let mut redis = state.redis.clone();
+        #[allow(deprecated)]
+        let mut redis_block = match state.redis_client.get_async_connection().await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("falha obtendo conexão dedicada ao Redis: {}", e);
+                return;
+            }
+        };
+        let mut redis_mgr = state.redis.clone();
         loop {
-            let res: redis::RedisResult<Option<(String, String)>> = redis.brpop(&queue, 1.0).await;
+            let res: redis::RedisResult<Option<(String, String)>> =
+                redis_block.blpop(&queue, 1.0).await;
             match res {
                 Ok(Some((_k, val))) => {
                     if let Ok(mut job) = serde_json::from_str::<JobPayload>(&val) {
@@ -57,7 +67,6 @@ pub fn spawn_worker(state: AppState) {
                         let (proc_name, base) = match proc_choice {
                             ProcChoice::Default => ("default", state.default_base.clone()),
                             ProcChoice::Fallback => ("fallback", state.fallback_base.clone()),
-                            ProcChoice::None => ("default", state.default_base.clone()),
                         };
                         let to = compute_timeout(&state, proc_name).await;
                         let url = format!("{}/payments", base);
@@ -72,7 +81,7 @@ pub fn spawn_worker(state: AppState) {
                         if success {
                             let now = Utc::now();
                             if let Err(e) = record_event(
-                                &mut redis,
+                                &mut redis_mgr,
                                 proc_name,
                                 now,
                                 &job.correlation_id,
@@ -87,7 +96,8 @@ pub fn spawn_worker(state: AppState) {
                             if job.attempts <= state.max_retries {
                                 tokio::time::sleep(state.retry_backoff).await;
                                 if let Ok(s) = serde_json::to_string(&job) {
-                                    let _: Result<(), _> = redis.lpush(&queue, s).await;
+                                    // re-enfileira usando conexão de manager (não bloqueante)
+                                    let _: Result<(), _> = redis_mgr.lpush(&queue, s).await;
                                 }
                             }
                         }
@@ -95,10 +105,17 @@ pub fn spawn_worker(state: AppState) {
                 }
                 Ok(None) => { /* timeout */ }
                 Err(err) => {
-                    eprintln!("erro na fila: {}", err);
+                    eprintln!("erro na fila (BLPOP): {}", err);
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
             }
         }
     });
+}
+
+// Spawna N workers
+pub fn spawn_workers(state: AppState, n: usize) {
+    for _ in 0..n {
+        spawn_worker(state.clone());
+    }
 }
