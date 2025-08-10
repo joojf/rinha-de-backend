@@ -1,0 +1,104 @@
+use chrono::Utc;
+use redis::AsyncCommands;
+use tokio::time::{Duration, Instant, sleep};
+
+use crate::models::{HealthResponse, JobPayload, ProcessorPayment};
+use crate::redis_ops::record_event;
+use crate::state::{AppState, ProcChoice, choose_target, compute_timeout, update_circuit_after};
+
+// Tarefa de health-check com 1 chamada a cada 5s por serviço
+pub fn spawn_health_checker(state: AppState, is_default: bool) {
+    let base = if is_default {
+        state.default_base.clone()
+    } else {
+        state.fallback_base.clone()
+    };
+    let http = state.http.clone();
+    let health = state.health.clone();
+    tokio::spawn(async move {
+        let url = format!("{}/payments/service-health", base);
+        loop {
+            let started = Instant::now();
+            let result = http.get(&url).send().await;
+            if let Ok(resp) = result {
+                if resp.status().is_success() {
+                    if let Ok(h) = resp.json::<HealthResponse>().await {
+                        let mut hs = health.write().await;
+                        let ps = if is_default {
+                            &mut hs.default
+                        } else {
+                            &mut hs.fallback
+                        };
+                        ps.health.failing = Some(h.failing);
+                        ps.health.min_response_time_ms = Some(h.min_response_time);
+                        ps.health.last_checked = Some(Instant::now());
+                    }
+                }
+            }
+            let elapsed = started.elapsed();
+            if elapsed < Duration::from_secs(5) {
+                sleep(Duration::from_secs(5) - elapsed).await;
+            }
+        }
+    });
+}
+
+// Worker que consome a fila do Redis e processa pagamentos
+pub fn spawn_worker(state: AppState) {
+    tokio::spawn(async move {
+        let queue = state.queue_key.clone();
+        let mut redis = state.redis.clone();
+        loop {
+            let res: redis::RedisResult<Option<(String, String)>> = redis.brpop(&queue, 1.0).await;
+            match res {
+                Ok(Some((_k, val))) => {
+                    if let Ok(mut job) = serde_json::from_str::<JobPayload>(&val) {
+                        let proc_choice = choose_target(&state).await;
+                        let (proc_name, base) = match proc_choice {
+                            ProcChoice::Default => ("default", state.default_base.clone()),
+                            ProcChoice::Fallback => ("fallback", state.fallback_base.clone()),
+                            ProcChoice::None => ("default", state.default_base.clone()),
+                        };
+                        let to = compute_timeout(&state, proc_name).await;
+                        let url = format!("{}/payments", base);
+                        let req = state.http.post(&url).timeout(to).json(&ProcessorPayment {
+                            correlation_id: &job.correlation_id,
+                            amount: job.amount,
+                            requested_at: job.requested_at.clone(),
+                        });
+                        let resp = req.send().await;
+                        let success = matches!(&resp, Ok(r) if r.status().is_success());
+                        update_circuit_after(&state, proc_name, success).await;
+                        if success {
+                            let now = Utc::now();
+                            if let Err(e) = record_event(
+                                &mut redis,
+                                proc_name,
+                                now,
+                                &job.correlation_id,
+                                job.amount,
+                            )
+                            .await
+                            {
+                                eprintln!("erro registrando evento: {}", e);
+                            }
+                        } else {
+                            job.attempts = job.attempts.saturating_add(1);
+                            if job.attempts <= state.max_retries {
+                                tokio::time::sleep(state.retry_backoff).await;
+                                if let Ok(s) = serde_json::to_string(&job) {
+                                    let _: Result<(), _> = redis.lpush(&queue, s).await;
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(None) => { /* timeout */ }
+                Err(err) => {
+                    eprintln!("erro na fila: {}", err);
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        }
+    });
+}
