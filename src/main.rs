@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, time::Duration};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use axum::{
     Json, Router,
@@ -13,6 +13,8 @@ use redis::aio::ConnectionManager;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tokio::sync::RwLock;
+use tokio::time::{Instant, sleep};
 use uuid::Uuid;
 
 // Estruturas de payload
@@ -39,6 +41,10 @@ struct AppState {
     default_base: String,
     fallback_base: String,
     req_timeout: Duration,
+    // Estado compartilhado: health dos serviços e circuit breaker
+    health: Arc<RwLock<HealthState>>,
+    cb_fail_threshold: u32,
+    cb_open_duration: Duration,
 }
 
 #[derive(Debug, Deserialize)]
@@ -59,6 +65,39 @@ struct SummarySide {
 struct SummaryOut {
     default: SummarySide,
     fallback: SummarySide,
+}
+
+// Estado de health + circuit breaker
+#[derive(Debug, Default, Clone)]
+struct HealthState {
+    default: ProcStatus,
+    fallback: ProcStatus,
+}
+
+#[derive(Debug, Default, Clone)]
+struct ProcStatus {
+    health: ProcHealth,
+    circuit: Circuit,
+}
+
+#[derive(Debug, Default, Clone)]
+struct ProcHealth {
+    failing: Option<bool>,
+    min_response_time_ms: Option<u64>,
+    last_checked: Option<Instant>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct Circuit {
+    failures: u32,
+    open_until: Option<Instant>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HealthResponse {
+    failing: bool,
+    #[serde(rename = "minResponseTime")]
+    min_response_time: u64,
 }
 
 #[derive(Error, Debug)]
@@ -103,6 +142,15 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|v| v.parse::<u64>().ok())
         .map(Duration::from_millis)
         .unwrap_or(Duration::from_millis(120));
+    let cb_fail_threshold = std::env::var("CB_FAIL_THRESHOLD")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(3);
+    let cb_open_duration = std::env::var("CB_OPEN_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::from_millis(1500));
 
     let http = Client::builder()
         .http1_only()
@@ -120,7 +168,14 @@ async fn main() -> anyhow::Result<()> {
         default_base,
         fallback_base,
         req_timeout,
+        health: Arc::new(RwLock::new(HealthState::default())),
+        cb_fail_threshold,
+        cb_open_duration,
     };
+
+    // Inicia health-checkers em background (1 chamada a cada 5s por serviço)
+    spawn_health_checker(state.clone(), true);
+    spawn_health_checker(state.clone(), false);
 
     let app = Router::new()
         .route("/payments", post(handle_payment))
@@ -172,26 +227,19 @@ async fn handle_payment(
         requested_at: now_str,
     };
 
-    // tenta default primeiro
-    let default_url = format!("{}/payments", state.default_base);
-    let fallback_url = format!("{}/payments", state.fallback_base);
+    // decisão com base no health + circuit breaker
+    let target = choose_target(&state).await;
+    let (proc_name, url) = match target {
+        ProcChoice::Default => ("default", format!("{}/payments", state.default_base)),
+        ProcChoice::Fallback => ("fallback", format!("{}/payments", state.fallback_base)),
+        ProcChoice::None => ("default", format!("{}/payments", state.default_base)),
+    };
 
-    let mut chosen: Option<&str> = None;
-    let resp_default = state.http.post(&default_url).json(&payload).send().await;
+    let resp = state.http.post(&url).json(&payload).send().await;
+    let success = matches!(&resp, Ok(r) if r.status().is_success());
+    update_circuit_after(&state, proc_name, success).await;
 
-    let ok_default = matches!(&resp_default, Ok(r) if r.status().is_success());
-    if ok_default {
-        chosen = Some("default");
-    } else {
-        // tenta fallback
-        let resp_fb = state.http.post(&fallback_url).json(&payload).send().await;
-        if matches!(&resp_fb, Ok(r) if r.status().is_success()) {
-            chosen = Some("fallback");
-        }
-    }
-
-    // atualiza métricas ou falha
-    if let Some(proc_name) = chosen {
+    if success {
         update_counters(&mut redis, proc_name, now, input.amount).await?;
         return Ok((
             StatusCode::ACCEPTED,
@@ -336,4 +384,95 @@ fn format_rfc3339_millis(ts: DateTime<Utc>) -> String {
     let millis = nsec / 1_000_000;
     let dt = Utc.timestamp_opt(secs, 0).unwrap();
     format!("{}.{:03}Z", dt.format("%Y-%m-%dT%H:%M:%S"), millis)
+}
+
+// Escolha de destino com base no estado atual
+enum ProcChoice {
+    Default,
+    Fallback,
+    None,
+}
+
+async fn choose_target(state: &AppState) -> ProcChoice {
+    let now = Instant::now();
+    let hs = state.health.read().await;
+    let def_open = hs
+        .default
+        .circuit
+        .open_until
+        .map(|t| t > now)
+        .unwrap_or(false);
+    let fb_open = hs
+        .fallback
+        .circuit
+        .open_until
+        .map(|t| t > now)
+        .unwrap_or(false);
+    let def_ok = hs.default.health.failing.map(|f| !f).unwrap_or(true);
+    let fb_ok = hs.fallback.health.failing.map(|f| !f).unwrap_or(true);
+
+    if !def_open && def_ok {
+        return ProcChoice::Default;
+    }
+    if !fb_open && fb_ok {
+        return ProcChoice::Fallback;
+    }
+    ProcChoice::Default
+}
+
+// Atualiza CB após a tentativa
+async fn update_circuit_after(state: &AppState, proc_name: &str, success: bool) {
+    let now = Instant::now();
+    let mut hs = state.health.write().await;
+    let ps = match proc_name {
+        "default" => &mut hs.default,
+        _ => &mut hs.fallback,
+    };
+    if success {
+        ps.circuit.failures = 0;
+        ps.circuit.open_until = None;
+    } else {
+        ps.circuit.failures = ps.circuit.failures.saturating_add(1);
+        if ps.circuit.failures >= state.cb_fail_threshold {
+            ps.circuit.open_until = Some(now + state.cb_open_duration);
+            ps.circuit.failures = 0;
+        }
+    }
+}
+
+// Tarefa de health-check com 1 chamada a cada 5s
+fn spawn_health_checker(state: AppState, is_default: bool) {
+    let base = if is_default {
+        state.default_base.clone()
+    } else {
+        state.fallback_base.clone()
+    };
+    let http = state.http.clone();
+    let health = state.health.clone();
+    tokio::spawn(async move {
+        let url = format!("{}/payments/service-health", base);
+        loop {
+            let started = Instant::now();
+            let result = http.get(&url).send().await;
+            if let Ok(resp) = result {
+                if resp.status().is_success() {
+                    if let Ok(h) = resp.json::<HealthResponse>().await {
+                        let mut hs = health.write().await;
+                        let ps = if is_default {
+                            &mut hs.default
+                        } else {
+                            &mut hs.fallback
+                        };
+                        ps.health.failing = Some(h.failing);
+                        ps.health.min_response_time_ms = Some(h.min_response_time);
+                        ps.health.last_checked = Some(Instant::now());
+                    }
+                }
+            }
+            let elapsed = started.elapsed();
+            if elapsed < Duration::from_secs(5) {
+                sleep(Duration::from_secs(5) - elapsed).await;
+            }
+        }
+    });
 }
