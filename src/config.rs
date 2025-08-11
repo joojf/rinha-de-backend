@@ -1,7 +1,5 @@
 use std::{net::SocketAddr, time::Duration};
 
-// Configuração da aplicação lida do ambiente
-// Preferimos centralizar parsing para facilitar testes e manutenção
 #[derive(Clone, Debug)]
 pub struct Config {
     pub bind_addr: SocketAddr,

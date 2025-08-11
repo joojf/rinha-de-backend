@@ -6,7 +6,6 @@ use crate::models::{HealthResponse, JobPayload, ProcessorPayment};
 use crate::redis_ops::record_event;
 use crate::state::{AppState, ProcChoice, choose_target, compute_timeout, update_circuit_after};
 
-// Tarefa de health-check com 1 chamada a cada 5s por serviço
 pub fn spawn_health_checker(state: AppState, is_default: bool) {
     let base = if is_default {
         state.default_base.clone()
@@ -43,10 +42,10 @@ pub fn spawn_health_checker(state: AppState, is_default: bool) {
     });
 }
 
-// Worker que consome a fila do Redis e processa pagamentos
+// worker que consome a fila do Redis e processa pagamentos
 pub fn spawn_worker(state: AppState) {
     tokio::spawn(async move {
-        // Conexão dedicada para operações bloqueantes (BLPOP)
+        // conexão dedicada para operações bloqueantes (BLPOP)
         let queue = state.queue_key.clone();
         #[allow(deprecated)]
         let mut redis_block = match state.redis_client.get_async_connection().await {
@@ -63,7 +62,7 @@ pub fn spawn_worker(state: AppState) {
             match res {
                 Ok(Some((_k, val))) => {
                     if let Ok(mut job) = serde_json::from_str::<JobPayload>(&val) {
-                        // Fixa o processador escolhido por job para evitar duplo processamento em serviços distintos
+                        // fixa o processador escolhido por job para evitar duplo processamento em serviços distintos
                         let proc = if let Some(ref p) = job.proc_name {
                             p.as_str()
                         } else {
@@ -80,13 +79,13 @@ pub fn spawn_worker(state: AppState) {
                         } else {
                             ("fallback", state.fallback_base.clone())
                         };
-                        // Verificar se já processamos com sucesso este correlationId neste processador
+                        // verificar se já processamos com sucesso este correlationId neste processador
                         let proc_key = format!("processed:{}:{}", proc_name, job.correlation_id);
                         let already_processed: Option<String> =
                             redis_mgr.get(&proc_key).await.unwrap_or(None);
 
                         let mut success = if already_processed.is_some() {
-                            // Já processado com sucesso anteriormente, pula o POST
+                            // já processado com sucesso anteriormente, pula o POST
                             true
                         } else {
                             let to = compute_timeout(&state, proc_name).await;
@@ -103,7 +102,7 @@ pub fn spawn_worker(state: AppState) {
                                 _ => false,
                             }
                         };
-                        // Se falhou ou expirou, tenta confirmar no processor via GET /payments/{id}
+                        // se falhou ou expirou, tenta confirmar no processor via GET /payments/{id}
                         if !success {
                             let det_url = format!("{}/payments/{}", base, job.correlation_id);
                             let det = state
@@ -114,14 +113,14 @@ pub fn spawn_worker(state: AppState) {
                                 .await;
                             if let Ok(r) = det {
                                 if r.status().is_success() {
-                                    // Marcar como processado para evitar futuras tentativas
+                                    // marcar como processado para evitar futuras tentativas
                                     let proc_key =
                                         format!("processed:{}:{}", proc_name, job.correlation_id);
                                     let _: Result<(), _> = redis_mgr
                                         .set_ex(&proc_key, 1, state.idemp_ttl as u64)
                                         .await;
 
-                                    // Considera como processado: registra localmente e evita retry
+                                    // considera como processado: registra localmente e evita retry
                                     let now = crate::timeutil::parse_rfc3339(&job.requested_at)
                                         .unwrap_or_else(Utc::now);
                                     let _ = record_event(
@@ -138,13 +137,13 @@ pub fn spawn_worker(state: AppState) {
                         }
                         update_circuit_after(&state, proc_name, success).await;
                         if success {
-                            // Marcar como processado com sucesso para evitar reprocessamento
+                            // marcar como processado com sucesso para evitar reprocessamento
                             let proc_key =
                                 format!("processed:{}:{}", proc_name, job.correlation_id);
                             let _: Result<(), _> =
                                 redis_mgr.set_ex(&proc_key, 1, state.idemp_ttl as u64).await;
 
-                            // Alinhar timestamp com o usado pelo processor (requestedAt)
+                            // alinhar timestamp com o usado pelo processor (requestedAt)
                             let now = crate::timeutil::parse_rfc3339(&job.requested_at)
                                 .unwrap_or_else(Utc::now);
                             let _ = record_event(

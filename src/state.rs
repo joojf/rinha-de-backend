@@ -8,7 +8,6 @@ use thiserror::Error;
 use tokio::sync::RwLock;
 use tokio::time::Instant;
 
-// Estado global compartilhado entre handlers e tarefas
 #[derive(Clone)]
 pub struct AppState {
     pub http: Client,
@@ -103,7 +102,6 @@ pub async fn build_state(cfg: &Config) -> anyhow::Result<AppState> {
     })
 }
 
-// Escolha de processador para envio
 pub enum ProcChoice {
     Default,
     Fallback,
@@ -169,7 +167,6 @@ pub async fn compute_timeout(state: &AppState, proc_name: &str) -> Duration {
         )
     };
     if let (Some(false), Some(ms)) = (failing, min_rt) {
-        // Ajuste: usar minResponseTime + margem, garantindo um piso razoável e respeitando req_timeout
         let mut base = ms + state.timeout_margin.as_millis() as u64;
         if base < 200 {
             base = 200;

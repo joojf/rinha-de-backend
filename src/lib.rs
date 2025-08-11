@@ -16,7 +16,6 @@ pub async fn start() -> anyhow::Result<()> {
     let cfg = config::Config::from_env()?;
     let state = state::build_state(&cfg).await?;
 
-    // Tarefas em background
     background::spawn_health_checker(state.clone(), true);
     background::spawn_health_checker(state.clone(), false);
     // múltiplos workers para throughput; valor via env

@@ -6,13 +6,9 @@ use uuid::Uuid;
 use crate::models::SummarySide;
 use crate::state::AppError;
 
-// Converte valor monetário em centavos inteiros para evitar erro de ponto flutuante
 fn to_cents(amount: f64) -> i64 {
     (amount * 100.0).round() as i64
 }
-
-// Atualiza contadores no Redis: bucket por segundo e totais
-// função removida: não estava em uso
 
 pub async fn read_totals(
     redis: &mut ConnectionManager,
@@ -71,7 +67,7 @@ pub async fn sum_range(
         }
         offset += ids.len() as isize;
     }
-    // Limpeza do snapshot temporário
+    // limpeza do snapshot temporário
     let _: () = redis.del(&tmp_key).await.map_err(anyhow::Error::from)?;
     Ok(SummarySide {
         total_requests: count_in_range as u64,
@@ -106,7 +102,7 @@ pub async fn record_event(
         .await
         .map_err(anyhow::Error::from)?;
 
-    // Atualiza totais apenas se o ID for novo (evita overcount em retries)
+    // atualiza totais apenas se o ID for novo (evita overcount em retries)
     if added == 1 {
         let total_count = format!("summary:{}:total_count", proc_name);
         let total_amount_c = format!("summary:{}:total_amount_cents", proc_name);

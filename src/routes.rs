@@ -13,7 +13,6 @@ use crate::redis_ops::*;
 use crate::state::{AppError, AppState};
 use crate::timeutil::{format_rfc3339_millis, parse_rfc3339};
 
-// Constrói o roteador principal
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/payments", post(handle_payment))
@@ -52,7 +51,7 @@ async fn handle_payment(
         ));
     }
 
-    // Enfileira job e responde 202
+    // enfileira job e responde 202
     let job = JobPayload {
         correlation_id: input.correlation_id,
         amount: input.amount,
