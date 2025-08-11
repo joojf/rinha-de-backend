@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   app1:
     image: ghcr.io/joojf/rinha-de-backend:latest
