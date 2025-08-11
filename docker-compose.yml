@@ -70,5 +70,7 @@ services:
           memory: "80MB"
 
 networks:
+  default:
+    driver: bridge
   payment-processor:
     external: true
