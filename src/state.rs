@@ -25,9 +25,6 @@ pub struct AppState {
     pub max_retries: u32,
     pub retry_backoff: Duration,
     pub timeout_margin: Duration,
-    pub debug: bool,
-    pub trace_txns: bool,
-    pub diag_compare: bool,
     pub admin_token: String,
 }
 
@@ -102,9 +99,6 @@ pub async fn build_state(cfg: &Config) -> anyhow::Result<AppState> {
         max_retries: cfg.max_retries,
         retry_backoff: cfg.retry_backoff,
         timeout_margin: cfg.timeout_margin,
-        debug: cfg.debug,
-        trace_txns: cfg.trace_txns,
-        diag_compare: cfg.diag_compare,
         admin_token: cfg.admin_token.clone(),
     })
 }

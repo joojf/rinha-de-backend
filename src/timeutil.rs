@@ -10,6 +10,9 @@ pub fn format_rfc3339_millis(ts: DateTime<Utc>) -> String {
     let secs = ts.timestamp();
     let nsec = ts.timestamp_subsec_nanos();
     let millis = nsec / 1_000_000;
-    let dt = Utc.timestamp_opt(secs, 0).unwrap();
+    let dt = match Utc.timestamp_opt(secs, 0) {
+        chrono::LocalResult::Single(dt) => dt,
+        _ => return ts.format("%Y-%m-%dT%H:%M:%S.%3fZ").to_string(),
+    };
     format!("{}.{:03}Z", dt.format("%Y-%m-%dT%H:%M:%S"), millis)
 }

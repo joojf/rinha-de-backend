@@ -108,17 +108,14 @@ pub fn spawn_worker(state: AppState) {
                                     // Considera como processado: registra localmente e evita retry
                                     let now = crate::timeutil::parse_rfc3339(&job.requested_at)
                                         .unwrap_or_else(Utc::now);
-                                    if let Err(e) = record_event(
+                                    let _ = record_event(
                                         &mut redis_mgr,
                                         proc_name,
                                         now,
                                         &job.correlation_id,
                                         job.amount,
                                     )
-                                    .await
-                                    {
-                                        eprintln!("erro registrando evento (confirm): {}", e);
-                                    }
+                                    .await;
                                     success = true;
                                 }
                             }
@@ -128,17 +125,14 @@ pub fn spawn_worker(state: AppState) {
                             // Alinhar timestamp com o usado pelo processor (requestedAt)
                             let now = crate::timeutil::parse_rfc3339(&job.requested_at)
                                 .unwrap_or_else(Utc::now);
-                            if let Err(e) = record_event(
+                            let _ = record_event(
                                 &mut redis_mgr,
                                 proc_name,
                                 now,
                                 &job.correlation_id,
                                 job.amount,
                             )
-                            .await
-                            {
-                                eprintln!("erro registrando evento: {}", e);
-                            }
+                            .await;
                         } else {
                             job.attempts = job.attempts.saturating_add(1);
                             if job.attempts <= state.max_retries {
@@ -152,8 +146,7 @@ pub fn spawn_worker(state: AppState) {
                     }
                 }
                 Ok(None) => { /* timeout */ }
-                Err(err) => {
-                    eprintln!("erro na fila (BLPOP): {}", err);
+                Err(_) => {
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
             }
