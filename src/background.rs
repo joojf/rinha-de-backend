@@ -80,20 +80,29 @@ pub fn spawn_worker(state: AppState) {
                         } else {
                             ("fallback", state.fallback_base.clone())
                         };
-                        let to = compute_timeout(&state, proc_name).await;
-                        let url = format!("{}/payments", base);
-                        let req = state.http.post(&url).timeout(to).json(&ProcessorPayment {
-                            correlation_id: &job.correlation_id,
-                            amount: job.amount,
-                            requested_at: job.requested_at.clone(),
-                        });
-                        let resp = req.send().await;
-                        let mut success = match &resp {
-                            Ok(r) if r.status().is_success() => true,
-                            Ok(r) if r.status().as_u16() == 409 => true, // já processado no processor
-                            _ => false,
+                        // Verificar se já processamos com sucesso este correlationId neste processador
+                        let proc_key = format!("processed:{}:{}", proc_name, job.correlation_id);
+                        let already_processed: Option<String> =
+                            redis_mgr.get(&proc_key).await.unwrap_or(None);
+
+                        let mut success = if already_processed.is_some() {
+                            // Já processado com sucesso anteriormente, pula o POST
+                            true
+                        } else {
+                            let to = compute_timeout(&state, proc_name).await;
+                            let url = format!("{}/payments", base);
+                            let req = state.http.post(&url).timeout(to).json(&ProcessorPayment {
+                                correlation_id: &job.correlation_id,
+                                amount: job.amount,
+                                requested_at: job.requested_at.clone(),
+                            });
+                            let resp = req.send().await;
+                            match &resp {
+                                Ok(r) if r.status().is_success() => true,
+                                Ok(r) if r.status().as_u16() == 409 => true,
+                                _ => false,
+                            }
                         };
-                        let _http_code = resp.as_ref().map(|r| r.status().as_u16()).unwrap_or(0);
                         // Se falhou ou expirou, tenta confirmar no processor via GET /payments/{id}
                         if !success {
                             let det_url = format!("{}/payments/{}", base, job.correlation_id);
@@ -105,6 +114,13 @@ pub fn spawn_worker(state: AppState) {
                                 .await;
                             if let Ok(r) = det {
                                 if r.status().is_success() {
+                                    // Marcar como processado para evitar futuras tentativas
+                                    let proc_key =
+                                        format!("processed:{}:{}", proc_name, job.correlation_id);
+                                    let _: Result<(), _> = redis_mgr
+                                        .set_ex(&proc_key, 1, state.idemp_ttl as u64)
+                                        .await;
+
                                     // Considera como processado: registra localmente e evita retry
                                     let now = crate::timeutil::parse_rfc3339(&job.requested_at)
                                         .unwrap_or_else(Utc::now);
@@ -122,6 +138,12 @@ pub fn spawn_worker(state: AppState) {
                         }
                         update_circuit_after(&state, proc_name, success).await;
                         if success {
+                            // Marcar como processado com sucesso para evitar reprocessamento
+                            let proc_key =
+                                format!("processed:{}:{}", proc_name, job.correlation_id);
+                            let _: Result<(), _> =
+                                redis_mgr.set_ex(&proc_key, 1, state.idemp_ttl as u64).await;
+
                             // Alinhar timestamp com o usado pelo processor (requestedAt)
                             let now = crate::timeutil::parse_rfc3339(&job.requested_at)
                                 .unwrap_or_else(Utc::now);
