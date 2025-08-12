@@ -1,6 +1,6 @@
 services:
   app1:
-    build: .
+    image: ghcr.io/joojf/rinha-de-backend:latest
     environment:
       - BIND_ADDR=0.0.0.0:9999
       - DEFAULT_URL=http://payment-processor-default:8080
@@ -25,7 +25,7 @@ services:
           memory: "120MB"
 
   app2:
-    build: .
+    image: ghcr.io/joojf/rinha-de-backend:latest
     environment:
       - BIND_ADDR=0.0.0.0:9999
       - DEFAULT_URL=http://payment-processor-default:8080
