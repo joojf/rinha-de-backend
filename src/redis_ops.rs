@@ -16,10 +16,17 @@ pub async fn read_totals(
 ) -> Result<SummarySide, AppError> {
     let total_count = format!("summary:{}:total_count", proc_name);
     let total_amount_c = format!("summary:{}:total_amount_cents", proc_name);
-    let (count, amount_c): (Option<i64>, Option<i64>) = redis
-        .mget((&total_count, &total_amount_c))
+    
+    // pipeline para leitura
+    let mut pipe = redis::pipe();
+    pipe.get(&total_count)
+        .get(&total_amount_c);
+    
+    let (count, amount_c): (Option<i64>, Option<i64>) = pipe
+        .query_async(redis)
         .await
         .map_err(anyhow::Error::from)?;
+    
     Ok(SummarySide {
         total_requests: count.unwrap_or(0) as u64,
         total_amount: amount_c.unwrap_or(0) as f64 / 100.0,
@@ -33,7 +40,7 @@ pub async fn sum_range(
     to_ms: i64,
 ) -> Result<SummarySide, AppError> {
     let key_z = format!("pay:{}", proc_name);
-    // Snapshot estável do range para evitar inconsistências durante paginação
+    // snapshot do range para paginação consistente
     let tmp_key = format!("tmp:sum:{}:{}", proc_name, Uuid::new_v4());
     let _: i64 = redis::cmd("ZRANGESTORE")
         .arg(&tmp_key)
@@ -67,7 +74,7 @@ pub async fn sum_range(
         }
         offset += ids.len() as isize;
     }
-    // limpeza do snapshot temporário
+    // limpa snapshot temporário
     let _: () = redis.del(&tmp_key).await.map_err(anyhow::Error::from)?;
     Ok(SummarySide {
         total_requests: count_in_range as u64,
@@ -87,22 +94,21 @@ pub async fn record_event(
     let id = correlation_id.to_string();
     let cents = to_cents(amount);
 
-    // HSET sempre sobrescreve o valor do id (idempotente para nossa soma)
-    let _: () = redis
+    // pipeline para operações redis
+    let mut pipe = redis::pipe();
+    pipe.atomic()
         .hset("payamtc", &id, cents)
-        .await
-        .map_err(anyhow::Error::from)?;
-    // ZADD NX retorna 1 se novo membro foi adicionado, 0 se já existia
-    let added: i64 = redis::cmd("ZADD")
+        .ignore()
+        .cmd("ZADD")
         .arg(&key_z)
         .arg("NX")
         .arg(epoch_ms)
-        .arg(&id)
-        .query_async(redis)
-        .await
-        .map_err(anyhow::Error::from)?;
+        .arg(&id);
+    
+    let results: ((), i64) = pipe.query_async(redis).await.map_err(anyhow::Error::from)?;
+    let added = results.1;
 
-    // atualiza totais apenas se o ID for novo (evita overcount em retries)
+    // atualiza totais se id novo (evita overcount)
     if added == 1 {
         let total_count = format!("summary:{}:total_count", proc_name);
         let total_amount_c = format!("summary:{}:total_amount_cents", proc_name);

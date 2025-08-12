@@ -32,26 +32,23 @@ async fn handle_payment(
     let now = Utc::now();
     let now_str = format_rfc3339_millis(now);
 
-    // idempotência via SET NX EX
+    // check de idempotência via set nx ex
     let mut redis = state.redis.clone();
     let corr_key = format!("corr:{}", input.correlation_id);
-    let set_res: Option<String> = redis::cmd("SET")
+    let set_res: bool = redis::cmd("SET")
         .arg(&corr_key)
-        .arg(1)
+        .arg("1")
         .arg("NX")
         .arg("EX")
         .arg(state.idemp_ttl)
         .query_async(&mut redis)
         .await
         .map_err(anyhow::Error::from)?;
-    if set_res.is_none() {
-        return Ok((
-            StatusCode::OK,
-            Json(serde_json::json!({"status":"duplicate"})),
-        ));
+    if !set_res {
+        return Ok((StatusCode::OK, Json(serde_json::json!({"s":"dup"}))));
     }
 
-    // enfileira job e responde 202
+    // enfileira job para processamento assíncrono
     let job = JobPayload {
         correlation_id: input.correlation_id,
         amount: input.amount,
@@ -65,10 +62,7 @@ async fn handle_payment(
         .await
         .map_err(anyhow::Error::from)?;
 
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(serde_json::json!({"status":"queued"})),
-    ))
+    Ok((StatusCode::ACCEPTED, Json(serde_json::json!({"s":"ok"}))))
 }
 
 // GET /payments-summary
@@ -78,9 +72,26 @@ async fn handle_summary(
 ) -> Result<impl IntoResponse, AppError> {
     let mut redis = state.redis.clone();
     if q.from.is_none() && q.to.is_none() {
-        let default = read_totals(&mut redis, "default").await?;
-        let fallback = read_totals(&mut redis, "fallback").await?;
-        let out = SummaryOut { default, fallback };
+        // caminho rápido: lê ambos totais em pipeline único
+        let mut pipe = redis::pipe();
+        pipe.get(&format!("summary:default:total_count"))
+            .get(&format!("summary:default:total_amount_cents"))
+            .get(&format!("summary:fallback:total_count"))
+            .get(&format!("summary:fallback:total_amount_cents"));
+        
+        let (def_count, def_amount, fb_count, fb_amount): (Option<i64>, Option<i64>, Option<i64>, Option<i64>) = 
+            pipe.query_async(&mut redis).await.map_err(anyhow::Error::from)?;
+        
+        let out = SummaryOut {
+            default: SummarySide {
+                total_requests: def_count.unwrap_or(0) as u64,
+                total_amount: def_amount.unwrap_or(0) as f64 / 100.0,
+            },
+            fallback: SummarySide {
+                total_requests: fb_count.unwrap_or(0) as u64,
+                total_amount: fb_amount.unwrap_or(0) as f64 / 100.0,
+            },
+        };
         return Ok((StatusCode::OK, Json(out)));
     }
 

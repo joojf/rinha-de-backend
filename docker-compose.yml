@@ -1,13 +1,18 @@
 services:
   app1:
-    image: ghcr.io/joojf/rinha-de-backend:latest
+    build: .
     environment:
       - BIND_ADDR=0.0.0.0:9999
       - DEFAULT_URL=http://payment-processor-default:8080
       - FALLBACK_URL=http://payment-processor-fallback:8080
       - REDIS_URL=redis://redis:6379
-      - REQ_TIMEOUT_MS=1200
-      - WORKERS=32
+      - REQ_TIMEOUT_MS=50
+      - WORKERS=6
+      - RETRY_BACKOFF_MS=10
+      - CB_FAIL_THRESHOLD=2
+      - CB_OPEN_MS=500
+      - TIMEOUT_MARGIN_MS=2
+      - MAX_RETRIES=2
     depends_on:
       - redis
     networks:
@@ -16,18 +21,23 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.6"
-          memory: "110MB"
+          cpus: "0.55"
+          memory: "120MB"
 
   app2:
-    image: ghcr.io/joojf/rinha-de-backend:latest
+    build: .
     environment:
       - BIND_ADDR=0.0.0.0:9999
       - DEFAULT_URL=http://payment-processor-default:8080
       - FALLBACK_URL=http://payment-processor-fallback:8080
       - REDIS_URL=redis://redis:6379
-      - REQ_TIMEOUT_MS=1200
-      - WORKERS=32
+      - REQ_TIMEOUT_MS=50
+      - WORKERS=6
+      - RETRY_BACKOFF_MS=10
+      - CB_FAIL_THRESHOLD=2
+      - CB_OPEN_MS=500
+      - TIMEOUT_MARGIN_MS=2
+      - MAX_RETRIES=2
     depends_on:
       - redis
     networks:
@@ -36,8 +46,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.6"
-          memory: "110MB"
+          cpus: "0.55"
+          memory: "120MB"
 
   nginx:
     image: nginx:1.29-alpine
@@ -54,18 +64,18 @@ services:
       resources:
         limits:
           cpus: "0.1"
-          memory: "50MB"
+          memory: "40MB"
 
   redis:
     image: redis:7.2-alpine
-    command: ["redis-server", "--appendonly", "no"]
+    command: ["redis-server", "--appendonly", "no", "--maxmemory-policy", "allkeys-lru", "--tcp-keepalive", "60"]
     networks:
       - default
     deploy:
       resources:
         limits:
-          cpus: "0.2"
-          memory: "80MB"
+          cpus: "0.3"
+          memory: "70MB"
 
 networks:
   default:

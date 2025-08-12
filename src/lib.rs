@@ -18,7 +18,7 @@ pub async fn start() -> anyhow::Result<()> {
 
     background::spawn_health_checker(state.clone(), true);
     background::spawn_health_checker(state.clone(), false);
-    // múltiplos workers para throughput; valor via env
+    // spawna workers conforme config
     background::spawn_workers(state.clone(), cfg.workers);
 
     let app: Router = routes::router(state);

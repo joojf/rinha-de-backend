@@ -74,9 +74,11 @@ impl axum::response::IntoResponse for AppError {
 pub async fn build_state(cfg: &Config) -> anyhow::Result<AppState> {
     let http = Client::builder()
         .http1_only()
-        .pool_max_idle_per_host(64)
-        .pool_idle_timeout(Duration::from_secs(10))
-        .tcp_keepalive(Duration::from_secs(30))
+        .pool_max_idle_per_host(128)
+        .pool_idle_timeout(Duration::from_secs(5))
+        .tcp_keepalive(Duration::from_secs(10))
+        .tcp_nodelay(true)
+        .connect_timeout(Duration::from_millis(20))
         .timeout(cfg.req_timeout)
         .build()?;
 
@@ -110,27 +112,24 @@ pub enum ProcChoice {
 pub async fn choose_target(state: &AppState) -> ProcChoice {
     let now = Instant::now();
     let hs = state.health.read().await;
-    let def_open = hs
-        .default
-        .circuit
-        .open_until
-        .map(|t| t > now)
-        .unwrap_or(false);
-    let fb_open = hs
-        .fallback
-        .circuit
-        .open_until
-        .map(|t| t > now)
-        .unwrap_or(false);
-    let def_ok = hs.default.health.failing.map(|f| !f).unwrap_or(true);
-    let fb_ok = hs.fallback.health.failing.map(|f| !f).unwrap_or(true);
-
-    if !def_open && def_ok {
+    
+    // prioriza baseado em circuit breaker e health
+    let def_circuit_open = hs.default.circuit.open_until.map_or(false, |t| t > now);
+    let fb_circuit_open = hs.fallback.circuit.open_until.map_or(false, |t| t > now);
+    let def_failing = hs.default.health.failing.unwrap_or(false);
+    let fb_failing = hs.fallback.health.failing.unwrap_or(false);
+    
+    // caminho rápido: default disponível
+    if !def_circuit_open && !def_failing {
         return ProcChoice::Default;
     }
-    if !fb_open && fb_ok {
+    
+    // fallback se disponível
+    if !fb_circuit_open && !fb_failing {
         return ProcChoice::Fallback;
     }
+    
+    // último recurso: default mesmo se não ideal
     ProcChoice::Default
 }
 
@@ -142,12 +141,17 @@ pub async fn update_circuit_after(state: &AppState, proc_name: &str, success: bo
         _ => &mut hs.fallback,
     };
     if success {
-        ps.circuit.failures = 0;
-        ps.circuit.open_until = None;
+        // recuperação gradual
+        ps.circuit.failures = ps.circuit.failures.saturating_sub(1);
+        if ps.circuit.failures == 0 {
+            ps.circuit.open_until = None;
+        }
     } else {
         ps.circuit.failures = ps.circuit.failures.saturating_add(1);
         if ps.circuit.failures >= state.cb_fail_threshold {
-            ps.circuit.open_until = Some(now + state.cb_open_duration);
+            // backoff exponencial do circuit breaker
+            let multiplier = 1 << ps.circuit.failures.min(4);
+            ps.circuit.open_until = Some(now + state.cb_open_duration * multiplier);
             ps.circuit.failures = 0;
         }
     }
@@ -167,12 +171,8 @@ pub async fn compute_timeout(state: &AppState, proc_name: &str) -> Duration {
         )
     };
     if let (Some(false), Some(ms)) = (failing, min_rt) {
-        let mut base = ms + state.timeout_margin.as_millis() as u64;
-        if base < 200 {
-            base = 200;
-        }
-        let to = base.max(state.req_timeout.as_millis() as u64);
-        Duration::from_millis(to)
+        let base = (ms + state.timeout_margin.as_millis() as u64).min(60);
+        Duration::from_millis(base.max(state.req_timeout.as_millis() as u64))
     } else {
         state.req_timeout
     }

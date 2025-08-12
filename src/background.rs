@@ -18,7 +18,7 @@ pub fn spawn_health_checker(state: AppState, is_default: bool) {
         let url = format!("{}/payments/service-health", base);
         loop {
             let started = Instant::now();
-            let result = http.get(&url).send().await;
+            let result = http.get(&url).timeout(Duration::from_millis(200)).send().await;
             if let Ok(resp) = result {
                 if resp.status().is_success() {
                     if let Ok(h) = resp.json::<HealthResponse>().await {
@@ -45,7 +45,7 @@ pub fn spawn_health_checker(state: AppState, is_default: bool) {
 // worker que consome a fila do Redis e processa pagamentos
 pub fn spawn_worker(state: AppState) {
     tokio::spawn(async move {
-        // conexão dedicada para operações bloqueantes (BLPOP)
+        // conexão dedicada para blpop
         let queue = state.queue_key.clone();
         #[allow(deprecated)]
         let mut redis_block = match state.redis_client.get_async_connection().await {
@@ -62,7 +62,7 @@ pub fn spawn_worker(state: AppState) {
             match res {
                 Ok(Some((_k, val))) => {
                     if let Ok(mut job) = serde_json::from_str::<JobPayload>(&val) {
-                        // fixa o processador escolhido por job para evitar duplo processamento em serviços distintos
+                        // escolhe processador por job (idempotente)
                         let proc = if let Some(ref p) = job.proc_name {
                             p.as_str()
                         } else {
@@ -79,13 +79,15 @@ pub fn spawn_worker(state: AppState) {
                         } else {
                             ("fallback", state.fallback_base.clone())
                         };
-                        // verificar se já processamos com sucesso este correlationId neste processador
+                        // check se já foi processado
                         let proc_key = format!("processed:{}:{}", proc_name, job.correlation_id);
-                        let already_processed: Option<String> =
-                            redis_mgr.get(&proc_key).await.unwrap_or(None);
+                        let already_processed: bool = redis_mgr
+                            .exists(&proc_key)
+                            .await
+                            .unwrap_or(false);
 
-                        let mut success = if already_processed.is_some() {
-                            // já processado com sucesso anteriormente, pula o POST
+                        let mut success = if already_processed {
+                            // já processado, pula post
                             true
                         } else {
                             let to = compute_timeout(&state, proc_name).await;
@@ -102,7 +104,7 @@ pub fn spawn_worker(state: AppState) {
                                 _ => false,
                             }
                         };
-                        // se falhou ou expirou, tenta confirmar no processor via GET /payments/{id}
+                        // se falhou, tenta confirmar via get
                         if !success {
                             let det_url = format!("{}/payments/{}", base, job.correlation_id);
                             let det = state
@@ -113,14 +115,14 @@ pub fn spawn_worker(state: AppState) {
                                 .await;
                             if let Ok(r) = det {
                                 if r.status().is_success() {
-                                    // marcar como processado para evitar futuras tentativas
+                                    // marca como processado
                                     let proc_key =
                                         format!("processed:{}:{}", proc_name, job.correlation_id);
                                     let _: Result<(), _> = redis_mgr
                                         .set_ex(&proc_key, 1, state.idemp_ttl as u64)
                                         .await;
 
-                                    // considera como processado: registra localmente e evita retry
+                                    // registra pagamento
                                     let now = crate::timeutil::parse_rfc3339(&job.requested_at)
                                         .unwrap_or_else(Utc::now);
                                     let _ = record_event(
@@ -137,13 +139,13 @@ pub fn spawn_worker(state: AppState) {
                         }
                         update_circuit_after(&state, proc_name, success).await;
                         if success {
-                            // marcar como processado com sucesso para evitar reprocessamento
+                            // marca como processado
                             let proc_key =
                                 format!("processed:{}:{}", proc_name, job.correlation_id);
                             let _: Result<(), _> =
                                 redis_mgr.set_ex(&proc_key, 1, state.idemp_ttl as u64).await;
 
-                            // alinhar timestamp com o usado pelo processor (requestedAt)
+                            // registra evento com timestamp correto
                             let now = crate::timeutil::parse_rfc3339(&job.requested_at)
                                 .unwrap_or_else(Utc::now);
                             let _ = record_event(
@@ -157,16 +159,18 @@ pub fn spawn_worker(state: AppState) {
                         } else {
                             job.attempts = job.attempts.saturating_add(1);
                             if job.attempts <= state.max_retries {
-                                tokio::time::sleep(state.retry_backoff).await;
+                                // exponential backoff anti thundering herd
+                                let delay = state.retry_backoff.as_millis() as u64 * (1 << (job.attempts - 1).min(3));
+                                tokio::time::sleep(Duration::from_millis(delay)).await;
                                 if let Ok(s) = serde_json::to_string(&job) {
-                                    // re-enfileira usando conexão de manager (não bloqueante)
-                                    let _: Result<(), _> = redis_mgr.lpush(&queue, s).await;
+                                    // reenfileira job
+                                    let _: Result<(), _> = redis_mgr.rpush(&queue, s).await;
                                 }
                             }
                         }
                     }
                 }
-                Ok(None) => { /* timeout */ }
+                Ok(None) => { /* blpop timeout */ }
                 Err(_) => {
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
@@ -175,7 +179,7 @@ pub fn spawn_worker(state: AppState) {
     });
 }
 
-// Spawna N workers
+// spawna n workers
 pub fn spawn_workers(state: AppState, n: usize) {
     for _ in 0..n {
         spawn_worker(state.clone());
