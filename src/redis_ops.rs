@@ -5,11 +5,13 @@ use uuid::Uuid;
 
 use crate::models::SummarySide;
 use crate::state::AppError;
+use tokio::time::Instant;
 
 fn to_cents(amount: f64) -> i64 {
     (amount * 100.0).round() as i64
 }
 
+#[allow(dead_code)]
 pub async fn read_totals(
     redis: &mut ConnectionManager,
     proc_name: &str,
@@ -39,27 +41,30 @@ pub async fn sum_range(
     from_ms: i64,
     to_ms: i64,
 ) -> Result<SummarySide, AppError> {
+    let t0 = Instant::now();
     let key_z = format!("pay:{}", proc_name);
-    // snapshot do range para paginação consistente
-    let tmp_key = format!("tmp:sum:{}:{}", proc_name, Uuid::new_v4());
-    let _: i64 = redis::cmd("ZRANGESTORE")
-        .arg(&tmp_key)
-        .arg(&key_z)
-        .arg(from_ms)
-        .arg(to_ms)
-        .arg("BYSCORE")
-        .query_async(redis)
+    // contagem rápida do range; evita custo quando vazio
+    let count_in_range: i64 = redis
+        .zcount(&key_z, from_ms, to_ms)
         .await
         .map_err(anyhow::Error::from)?;
+    if count_in_range == 0 {
+        return Ok(SummarySide { total_requests: 0, total_amount: 0.0 });
+    }
 
-    let count_in_range: i64 = redis.zcard(&tmp_key).await.map_err(anyhow::Error::from)?;
-
+    // varre em páginas sem snapshot, para reduzir custo e memória
     let mut total_amount_cents: i64 = 0;
-    const CHUNK: isize = 2048;
-    let mut offset: isize = 0;
+    const CHUNK: i64 = 2048;
+    let mut offset: i64 = 0;
     loop {
-        let ids: Vec<String> = redis
-            .zrange(&tmp_key, offset, offset + CHUNK - 1)
+        let ids: Vec<String> = redis::cmd("ZRANGEBYSCORE")
+            .arg(&key_z)
+            .arg(from_ms)
+            .arg(to_ms)
+            .arg("LIMIT")
+            .arg(offset)
+            .arg(CHUNK)
+            .query_async(redis)
             .await
             .map_err(anyhow::Error::from)?;
         if ids.is_empty() {
@@ -72,14 +77,16 @@ pub async fn sum_range(
         for v in amts.into_iter().flatten() {
             total_amount_cents = total_amount_cents.saturating_add(v)
         }
-        offset += ids.len() as isize;
+        offset += ids.len() as i64;
+        if (ids.len() as i64) < CHUNK { break; }
     }
-    // limpa snapshot temporário
-    let _: () = redis.del(&tmp_key).await.map_err(anyhow::Error::from)?;
-    Ok(SummarySide {
+    let out = SummarySide {
         total_requests: count_in_range as u64,
         total_amount: total_amount_cents as f64 / 100.0,
-    })
+    };
+    let elapsed = t0.elapsed().as_millis() as u64;
+    if elapsed >= 10 { eprintln!("SLOW sum_range {}ms proc={} count={}", elapsed, proc_name, count_in_range); }
+    Ok(out)
 }
 
 pub async fn record_event(

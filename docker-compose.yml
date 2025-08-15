@@ -5,19 +5,23 @@ services:
       - BIND_ADDR=0.0.0.0:9999
       - DEFAULT_URL=http://payment-processor-default:8080
       - FALLBACK_URL=http://payment-processor-fallback:8080
-      - REDIS_URL=redis://redis:6379
+      - REDIS_SOCKET=/socket/redis.sock
       - REQ_TIMEOUT_MS=50
-      - WORKERS=6
+      - WORKERS=4
+      - PROC_CONCURRENCY=8
       - RETRY_BACKOFF_MS=10
       - CB_FAIL_THRESHOLD=2
       - CB_OPEN_MS=500
       - TIMEOUT_MARGIN_MS=2
       - MAX_RETRIES=2
+      - TRACE_SLOW_MS=10
     depends_on:
       - redis
     networks:
       - default
       - payment-processor
+    volumes:
+      - redis-sock:/socket
     deploy:
       resources:
         limits:
@@ -30,19 +34,23 @@ services:
       - BIND_ADDR=0.0.0.0:9999
       - DEFAULT_URL=http://payment-processor-default:8080
       - FALLBACK_URL=http://payment-processor-fallback:8080
-      - REDIS_URL=redis://redis:6379
+      - REDIS_SOCKET=/socket/redis.sock
       - REQ_TIMEOUT_MS=50
-      - WORKERS=6
+      - WORKERS=4
+      - PROC_CONCURRENCY=8
       - RETRY_BACKOFF_MS=10
       - CB_FAIL_THRESHOLD=2
       - CB_OPEN_MS=500
       - TIMEOUT_MARGIN_MS=2
       - MAX_RETRIES=2
+      - TRACE_SLOW_MS=10
     depends_on:
       - redis
     networks:
       - default
       - payment-processor
+    volumes:
+      - redis-sock:/socket
     deploy:
       resources:
         limits:
@@ -68,9 +76,15 @@ services:
 
   redis:
     image: redis:7.2-alpine
-    command: ["redis-server", "--appendonly", "no", "--maxmemory-policy", "allkeys-lru", "--tcp-keepalive", "60"]
+    command: >-
+      sh -c "mkdir -p /socket && chown -R redis:redis /socket && \
+      exec redis-server --appendonly no --save '' --port 0 \
+      --unixsocket /socket/redis.sock --unixsocketperm 777 \
+      --maxmemory-policy allkeys-lru --tcp-keepalive 60"
     networks:
       - default
+    volumes:
+      - redis-sock:/socket
     deploy:
       resources:
         limits:
@@ -82,3 +96,6 @@ networks:
     driver: bridge
   payment-processor:
     external: true
+
+volumes:
+  redis-sock:

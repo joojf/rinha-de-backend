@@ -2,10 +2,14 @@ use std::{sync::Arc, time::Duration};
 
 use crate::config::Config;
 use redis::Client as RedisClient;
+use redis::ConnectionAddr;
+use redis::ConnectionInfo;
+use redis::RedisConnectionInfo;
 use redis::aio::ConnectionManager;
 use reqwest::Client;
 use thiserror::Error;
 use tokio::sync::RwLock;
+use tokio::sync::Semaphore;
 use tokio::time::Instant;
 
 #[derive(Clone)]
@@ -16,6 +20,7 @@ pub struct AppState {
     pub default_base: String,
     pub fallback_base: String,
     pub req_timeout: Duration,
+    pub trace_slow_ms: u64,
     pub health: Arc<RwLock<HealthState>>,
     pub cb_fail_threshold: u32,
     pub cb_open_duration: Duration,
@@ -25,6 +30,8 @@ pub struct AppState {
     pub retry_backoff: Duration,
     pub timeout_margin: Duration,
     pub admin_token: String,
+    pub sem_default: Arc<Semaphore>,
+    pub sem_fallback: Arc<Semaphore>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -82,7 +89,19 @@ pub async fn build_state(cfg: &Config) -> anyhow::Result<AppState> {
         .timeout(cfg.req_timeout)
         .build()?;
 
-    let client = redis::Client::open(cfg.redis_url.clone())?;
+    let client = if let Some(path) = &cfg.redis_socket {
+        let info = ConnectionInfo {
+            addr: ConnectionAddr::Unix(path.into()),
+            redis: RedisConnectionInfo {
+                db: 0,
+                username: None,
+                password: None,
+            },
+        };
+        redis::Client::open(info)?
+    } else {
+        redis::Client::open(cfg.redis_url.clone())?
+    };
     let manager = ConnectionManager::new(client.clone()).await?;
 
     Ok(AppState {
@@ -92,6 +111,7 @@ pub async fn build_state(cfg: &Config) -> anyhow::Result<AppState> {
         default_base: cfg.default_base.clone(),
         fallback_base: cfg.fallback_base.clone(),
         req_timeout: cfg.req_timeout,
+        trace_slow_ms: cfg.trace_slow_ms,
         health: Arc::new(RwLock::new(HealthState::default())),
         cb_fail_threshold: cfg.cb_fail_threshold,
         cb_open_duration: cfg.cb_open_duration,
@@ -101,6 +121,8 @@ pub async fn build_state(cfg: &Config) -> anyhow::Result<AppState> {
         retry_backoff: cfg.retry_backoff,
         timeout_margin: cfg.timeout_margin,
         admin_token: cfg.admin_token.clone(),
+        sem_default: Arc::new(Semaphore::new(cfg.proc_concurrency)),
+        sem_fallback: Arc::new(Semaphore::new(cfg.proc_concurrency)),
     })
 }
 
@@ -171,8 +193,10 @@ pub async fn compute_timeout(state: &AppState, proc_name: &str) -> Duration {
         )
     };
     if let (Some(false), Some(ms)) = (failing, min_rt) {
-        let base = (ms + state.timeout_margin.as_millis() as u64).min(60);
-        Duration::from_millis(base.max(state.req_timeout.as_millis() as u64))
+        let base = ms + state.timeout_margin.as_millis() as u64;
+        // Permite base maior que req_timeout, com teto seguro para evitar pendurar
+        let max_cap = 200u64;
+        Duration::from_millis(base.max(state.req_timeout.as_millis() as u64).min(max_cap))
     } else {
         state.req_timeout
     }

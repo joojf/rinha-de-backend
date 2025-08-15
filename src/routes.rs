@@ -6,6 +6,7 @@ use axum::{
     routing::{get, post},
 };
 use chrono::{DateTime, Utc};
+use tokio::time::Instant;
 use redis::AsyncCommands;
 
 use crate::models::*;
@@ -25,6 +26,7 @@ async fn handle_payment(
     State(state): State<AppState>,
     Json(input): Json<PaymentIn>,
 ) -> Result<impl IntoResponse, AppError> {
+    let t0 = Instant::now();
     if !input.amount.is_finite() || input.amount <= 0.0 {
         return Err(AppError::InvalidAmount);
     }
@@ -62,6 +64,8 @@ async fn handle_payment(
         .await
         .map_err(anyhow::Error::from)?;
 
+    let elapsed_ms = t0.elapsed().as_millis() as u64;
+    if elapsed_ms >= state.trace_slow_ms { eprintln!("SLOW /payments {}ms corr={} amt={}", elapsed_ms, input.correlation_id, input.amount); }
     Ok((StatusCode::ACCEPTED, Json(serde_json::json!({"s":"ok"}))))
 }
 
@@ -70,6 +74,7 @@ async fn handle_summary(
     State(state): State<AppState>,
     Query(q): Query<SummaryQuery>,
 ) -> Result<impl IntoResponse, AppError> {
+    let t0 = Instant::now();
     let mut redis = state.redis.clone();
     if q.from.is_none() && q.to.is_none() {
         // caminho rápido: lê ambos totais em pipeline único
@@ -92,6 +97,8 @@ async fn handle_summary(
                 total_amount: fb_amount.unwrap_or(0) as f64 / 100.0,
             },
         };
+        let elapsed_ms = t0.elapsed().as_millis() as u64;
+        if elapsed_ms >= state.trace_slow_ms { eprintln!("SLOW /payments-summary fast {}ms", elapsed_ms); }
         return Ok((StatusCode::OK, Json(out)));
     }
 
@@ -111,5 +118,7 @@ async fn handle_summary(
     let default = sum_range(&mut redis, "default", from_ms, to_ms).await?;
     let fallback = sum_range(&mut redis, "fallback", from_ms, to_ms).await?;
 
+    let elapsed_ms = t0.elapsed().as_millis() as u64;
+    if elapsed_ms >= state.trace_slow_ms { eprintln!("SLOW /payments-summary ranged {}ms from={} to={}", elapsed_ms, q.from.as_deref().unwrap_or(""), q.to.as_deref().unwrap_or("")); }
     Ok((StatusCode::OK, Json(SummaryOut { default, fallback })))
 }

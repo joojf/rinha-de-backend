@@ -45,6 +45,7 @@ pub fn spawn_health_checker(state: AppState, is_default: bool) {
 // worker que consome a fila do Redis e processa pagamentos
 pub fn spawn_worker(state: AppState) {
     tokio::spawn(async move {
+        let slow_ms = state.trace_slow_ms;
         // conexão dedicada para blpop
         let queue = state.queue_key.clone();
         #[allow(deprecated)]
@@ -57,6 +58,7 @@ pub fn spawn_worker(state: AppState) {
         };
         let mut redis_mgr = state.redis.clone();
         loop {
+            let t0 = Instant::now();
             let res: redis::RedisResult<Option<(String, String)>> =
                 redis_block.blpop(&queue, 1.0).await;
             match res {
@@ -74,10 +76,10 @@ pub fn spawn_worker(state: AppState) {
                             job.proc_name = Some(p.to_string());
                             p
                         };
-                        let (proc_name, base) = if proc == "default" {
-                            ("default", state.default_base.clone())
+                        let (proc_name, base, sem) = if proc == "default" {
+                            ("default", state.default_base.clone(), state.sem_default.clone())
                         } else {
-                            ("fallback", state.fallback_base.clone())
+                            ("fallback", state.fallback_base.clone(), state.sem_fallback.clone())
                         };
                         // check se já foi processado
                         let proc_key = format!("processed:{}:{}", proc_name, job.correlation_id);
@@ -90,6 +92,7 @@ pub fn spawn_worker(state: AppState) {
                             // já processado, pula post
                             true
                         } else {
+                            let _permit = sem.clone().acquire_owned().await.ok();
                             let to = compute_timeout(&state, proc_name).await;
                             let url = format!("{}/payments", base);
                             let req = state.http.post(&url).timeout(to).json(&ProcessorPayment {
@@ -107,6 +110,7 @@ pub fn spawn_worker(state: AppState) {
                         // se falhou, tenta confirmar via get
                         if !success {
                             let det_url = format!("{}/payments/{}", base, job.correlation_id);
+                            let _permit = sem.clone().acquire_owned().await.ok();
                             let det = state
                                 .http
                                 .get(&det_url)
@@ -168,6 +172,11 @@ pub fn spawn_worker(state: AppState) {
                                 }
                             }
                         }
+                        let elapsed = t0.elapsed().as_millis() as u64;
+                        if elapsed >= slow_ms { eprintln!(
+                            "SLOW worker {}ms proc={} corr={} attempts={} already_processed={}",
+                            elapsed, proc_name, job.correlation_id, job.attempts, already_processed
+                        ); }
                     }
                 }
                 Ok(None) => { /* blpop timeout */ }
