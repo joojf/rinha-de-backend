@@ -1,7 +1,7 @@
 use axum::{
     Json, Router,
     extract::{Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post},
 };
@@ -18,6 +18,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/payments", post(handle_payment))
         .route("/payments-summary", get(handle_summary))
+        .route("/admin/purge-payments", post(handle_admin_purge))
         .with_state(state)
 }
 
@@ -121,4 +122,66 @@ async fn handle_summary(
     let elapsed_ms = t0.elapsed().as_millis() as u64;
     if elapsed_ms >= state.trace_slow_ms { eprintln!("SLOW /payments-summary ranged {}ms from={} to={}", elapsed_ms, q.from.as_deref().unwrap_or(""), q.to.as_deref().unwrap_or("")); }
     Ok((StatusCode::OK, Json(SummaryOut { default, fallback })))
+}
+
+// POST /admin/purge-payments
+async fn handle_admin_purge(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, AppError> {
+    // valida token
+    let token = headers
+        .get("X-Rinha-Token")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if token != state.admin_token {
+        return Ok((StatusCode::UNAUTHORIZED, Json(serde_json::json!({"message":"unauthorized"}))));
+    }
+
+    let mut redis = state.redis.clone();
+    // limpa estruturas principais
+    let _: () = redis::pipe()
+        .del("pay:default")
+        .del("pay:fallback")
+        .del("payamtc")
+        .del("summary:default:total_count")
+        .del("summary:default:total_amount_cents")
+        .del("summary:fallback:total_count")
+        .del("summary:fallback:total_amount_cents")
+        .del(&state.queue_key)
+        .query_async(&mut redis)
+        .await
+        .map_err(anyhow::Error::from)?;
+
+    // remove chaves derivadas por padrão
+    async fn scan_del(redis: &mut redis::aio::ConnectionManager, pattern: &str) -> Result<(), AppError> {
+        let mut cursor: u64 = 0;
+        loop {
+            let (next, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+                .arg(cursor)
+                .arg("MATCH")
+                .arg(pattern)
+                .arg("COUNT")
+                .arg(500)
+                .query_async(redis)
+                .await
+                .map_err(anyhow::Error::from)?;
+            if !keys.is_empty() {
+                let _: () = redis::cmd("DEL")
+                    .arg(keys)
+                    .query_async(redis)
+                    .await
+                    .map_err(anyhow::Error::from)?;
+            }
+            if next == 0 { break; }
+            cursor = next;
+        }
+        Ok(())
+    }
+
+    // processed:* e corr:* podem ser muitos; varre com SCAN
+    scan_del(&mut redis, "processed:*").await?;
+    scan_del(&mut redis, "corr:*").await?;
+
+    Ok((StatusCode::OK, Json(serde_json::json!({"message":"All payments purged."}))))
 }

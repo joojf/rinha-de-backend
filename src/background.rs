@@ -107,38 +107,51 @@ pub fn spawn_worker(state: AppState) {
                                 _ => false,
                             }
                         };
-                        // se falhou, tenta confirmar via get
+                        // se falhou/timeout, confirma via GET com tentativas (evita perdas por timeout)
                         if !success {
                             let det_url = format!("{}/payments/{}", base, job.correlation_id);
-                            let _permit = sem.clone().acquire_owned().await.ok();
-                            let det = state
-                                .http
-                                .get(&det_url)
-                                .timeout(Duration::from_millis(300))
-                                .send()
-                                .await;
-                            if let Ok(r) = det {
-                                if r.status().is_success() {
-                                    // marca como processado
-                                    let proc_key =
-                                        format!("processed:{}:{}", proc_name, job.correlation_id);
-                                    let _: Result<(), _> = redis_mgr
-                                        .set_ex(&proc_key, 1, state.idemp_ttl as u64)
-                                        .await;
-
-                                    // registra pagamento
-                                    let now = crate::timeutil::parse_rfc3339(&job.requested_at)
-                                        .unwrap_or_else(Utc::now);
-                                    let _ = record_event(
-                                        &mut redis_mgr,
-                                        proc_name,
-                                        now,
-                                        &job.correlation_id,
-                                        job.amount,
-                                    )
+                            // Até 5 tentativas rápidas, backoff pequeno; timeouts ajustados
+                            let mut tries = 0u32;
+                            while !success && tries < 5 {
+                                tries += 1;
+                                let _permit = sem.clone().acquire_owned().await.ok();
+                                // timeout baseado no health min_response_time quando houver; com teto
+                                let mut to = crate::state::compute_timeout(&state, proc_name).await;
+                                if to < Duration::from_millis(200) { to = Duration::from_millis(200); }
+                                if to > Duration::from_millis(800) { to = Duration::from_millis(800); }
+                                let det = state
+                                    .http
+                                    .get(&det_url)
+                                    .timeout(to)
+                                    .send()
                                     .await;
-                                    success = true;
+                                if let Ok(r) = det {
+                                    if r.status().is_success() {
+                                        // marca como processado
+                                        let proc_key =
+                                            format!("processed:{}:{}", proc_name, job.correlation_id);
+                                        let _: Result<(), _> = redis_mgr
+                                            .set_ex(&proc_key, 1, state.idemp_ttl as u64)
+                                            .await;
+
+                                        // registra pagamento com timestamp do requestedAt
+                                        let now = crate::timeutil::parse_rfc3339(&job.requested_at)
+                                            .unwrap_or_else(Utc::now);
+                                        let _ = record_event(
+                                            &mut redis_mgr,
+                                            proc_name,
+                                            now,
+                                            &job.correlation_id,
+                                            job.amount,
+                                        )
+                                        .await;
+                                        success = true;
+                                        break;
+                                    }
                                 }
+                                // backoff curto e não bloqueante
+                                let sleep_ms = 20u64 * (1 << (tries.saturating_sub(1)).min(4));
+                                sleep(Duration::from_millis(sleep_ms)).await;
                             }
                         }
                         update_circuit_after(&state, proc_name, success).await;
