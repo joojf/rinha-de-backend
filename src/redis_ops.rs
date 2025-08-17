@@ -52,7 +52,7 @@ pub async fn sum_range(
         return Ok(SummarySide { total_requests: 0, total_amount: 0.0 });
     }
 
-    // varre em páginas sem snapshot, para reduzir custo e memória
+    // varre em páginas; simples e estável sob carga moderada
     let mut total_amount_cents: i64 = 0;
     const CHUNK: i64 = 2048;
     let mut offset: i64 = 0;
@@ -67,9 +67,7 @@ pub async fn sum_range(
             .query_async(redis)
             .await
             .map_err(anyhow::Error::from)?;
-        if ids.is_empty() {
-            break;
-        }
+        if ids.is_empty() { break; }
         let amts: Vec<Option<i64>> = redis
             .hget("payamtc", &ids)
             .await
@@ -119,12 +117,20 @@ pub async fn record_event(
     if added == 1 {
         let total_count = format!("summary:{}:total_count", proc_name);
         let total_amount_c = format!("summary:{}:total_amount_cents", proc_name);
+        let bucket_cnt = format!("bucket:{}:{}:count", proc_name, epoch_ms / 1000);
+        let bucket_amt = format!("bucket:{}:{}:amount_cents", proc_name, epoch_ms / 1000);
         let mut pipe = redis::pipe();
         pipe.atomic()
             .incr(&total_count, 1)
             .ignore()
             .cmd("INCRBY")
             .arg(&total_amount_c)
+            .arg(cents)
+            .ignore()
+            .incr(&bucket_cnt, 1)
+            .ignore()
+            .cmd("INCRBY")
+            .arg(&bucket_amt)
             .arg(cents)
             .ignore();
         let _: () = pipe.query_async(redis).await.map_err(anyhow::Error::from)?;

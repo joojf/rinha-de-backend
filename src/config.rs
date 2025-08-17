@@ -19,6 +19,7 @@ pub struct Config {
     pub workers: usize,
     pub admin_token: String,
     pub proc_concurrency: usize,
+    pub memstore_socket: Option<String>,
 }
 
 impl Config {
@@ -79,6 +80,7 @@ impl Config {
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(8);
         let admin_token = std::env::var("ADMIN_TOKEN").unwrap_or_else(|_| "123".to_string());
+        let memstore_socket = std::env::var("MEMSTORE_SOCKET").ok();
 
         Ok(Self {
             bind_addr,
@@ -98,6 +100,7 @@ impl Config {
             workers,
             admin_token,
             proc_concurrency,
+            memstore_socket,
         })
     }
 }

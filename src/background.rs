@@ -1,9 +1,8 @@
 use chrono::Utc;
-use redis::AsyncCommands;
 use tokio::time::{Duration, Instant, sleep};
 
 use crate::models::{HealthResponse, JobPayload, ProcessorPayment};
-use crate::redis_ops::record_event;
+use crate::memstore::{MsPayload, MsProc};
 use crate::state::{AppState, ProcChoice, choose_target, compute_timeout, update_circuit_after};
 
 pub fn spawn_health_checker(state: AppState, is_default: bool) {
@@ -42,28 +41,19 @@ pub fn spawn_health_checker(state: AppState, is_default: bool) {
     });
 }
 
-// worker que consome a fila do Redis e processa pagamentos
+// worker que consome a fila local (mpsc) e processa pagamentos
 pub fn spawn_worker(state: AppState) {
     tokio::spawn(async move {
         let slow_ms = state.trace_slow_ms;
-        // conexão dedicada para blpop
-        let queue = state.queue_key.clone();
-        #[allow(deprecated)]
-        let mut redis_block = match state.redis_client.get_async_connection().await {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("falha obtendo conexão dedicada ao Redis: {}", e);
-                return;
-            }
-        };
-        let mut redis_mgr = state.redis.clone();
         loop {
             let t0 = Instant::now();
-            let res: redis::RedisResult<Option<(String, String)>> =
-                redis_block.blpop(&queue, 1.0).await;
-            match res {
-                Ok(Some((_k, val))) => {
-                    if let Ok(mut job) = serde_json::from_str::<JobPayload>(&val) {
+            // recebe do canal compartilhado
+            let job_opt = {
+                let mut rx = state.queue_rx.lock().await;
+                rx.recv().await
+            };
+            match job_opt {
+                Some(mut job) => {
                         // escolhe processador por job (idempotente)
                         let proc = if let Some(ref p) = job.proc_name {
                             p.as_str()
@@ -81,12 +71,10 @@ pub fn spawn_worker(state: AppState) {
                         } else {
                             ("fallback", state.fallback_base.clone(), state.sem_fallback.clone())
                         };
-                        // check se já foi processado
-                        let proc_key = format!("processed:{}:{}", proc_name, job.correlation_id);
-                        let already_processed: bool = redis_mgr
-                            .exists(&proc_key)
-                            .await
-                            .unwrap_or(false);
+                        // check se já foi processado via memstore
+                        let already_processed: bool = if let Some(ms) = &state.memstore {
+                            ms.get(&job.correlation_id.to_string()).await.ok().flatten().is_some()
+                        } else { false };
 
                         let mut success = if already_processed {
                             // já processado, pula post
@@ -127,24 +115,19 @@ pub fn spawn_worker(state: AppState) {
                                     .await;
                                 if let Ok(r) = det {
                                     if r.status().is_success() {
-                                        // marca como processado
-                                        let proc_key =
-                                            format!("processed:{}:{}", proc_name, job.correlation_id);
-                                        let _: Result<(), _> = redis_mgr
-                                            .set_ex(&proc_key, 1, state.idemp_ttl as u64)
-                                            .await;
-
                                         // registra pagamento com timestamp do requestedAt
                                         let now = crate::timeutil::parse_rfc3339(&job.requested_at)
                                             .unwrap_or_else(Utc::now);
-                                        let _ = record_event(
-                                            &mut redis_mgr,
-                                            proc_name,
-                                            now,
-                                            &job.correlation_id,
-                                            job.amount,
-                                        )
-                                        .await;
+                                        if let Some(ms) = &state.memstore {
+                                            let _ = ms.set(
+                                                &job.correlation_id.to_string(),
+                                                &MsPayload {
+                                                    amount: job.amount,
+                                                    requested_at_ms: now.timestamp_millis(),
+                                                    proc_name: if proc_name == "default" { MsProc::Default } else { MsProc::Fallback },
+                                                },
+                                            ).await;
+                                        }
                                         success = true;
                                         break;
                                     }
@@ -156,46 +139,37 @@ pub fn spawn_worker(state: AppState) {
                         }
                         update_circuit_after(&state, proc_name, success).await;
                         if success {
-                            // marca como processado
-                            let proc_key =
-                                format!("processed:{}:{}", proc_name, job.correlation_id);
-                            let _: Result<(), _> =
-                                redis_mgr.set_ex(&proc_key, 1, state.idemp_ttl as u64).await;
-
                             // registra evento com timestamp correto
                             let now = crate::timeutil::parse_rfc3339(&job.requested_at)
                                 .unwrap_or_else(Utc::now);
-                            let _ = record_event(
-                                &mut redis_mgr,
-                                proc_name,
-                                now,
-                                &job.correlation_id,
-                                job.amount,
-                            )
-                            .await;
+                            if let Some(ms) = &state.memstore {
+                                let _ = ms.set(
+                                    &job.correlation_id.to_string(),
+                                    &MsPayload {
+                                        amount: job.amount,
+                                        requested_at_ms: now.timestamp_millis(),
+                                        proc_name: if proc_name == "default" { MsProc::Default } else { MsProc::Fallback },
+                                    },
+                                ).await;
+                            }
                         } else {
                             job.attempts = job.attempts.saturating_add(1);
-                            if job.attempts <= state.max_retries {
+                            let attempts = job.attempts;
+                            if attempts <= state.max_retries {
                                 // exponential backoff anti thundering herd
-                                let delay = state.retry_backoff.as_millis() as u64 * (1 << (job.attempts - 1).min(3));
+                                let delay = state.retry_backoff.as_millis() as u64 * (1 << (attempts - 1).min(3));
                                 tokio::time::sleep(Duration::from_millis(delay)).await;
-                                if let Ok(s) = serde_json::to_string(&job) {
-                                    // reenfileira job
-                                    let _: Result<(), _> = redis_mgr.rpush(&queue, s).await;
-                                }
+                                // reenfileira job
+                                let _ = state.queue_tx.send(job.clone());
                             }
                         }
                         let elapsed = t0.elapsed().as_millis() as u64;
                         if elapsed >= slow_ms { eprintln!(
-                            "SLOW worker {}ms proc={} corr={} attempts={} already_processed={}",
-                            elapsed, proc_name, job.correlation_id, job.attempts, already_processed
+                            "SLOW worker {}ms proc={} corr={} already_processed={}",
+                            elapsed, proc_name, job.correlation_id, already_processed
                         ); }
-                    }
                 }
-                Ok(None) => { /* blpop timeout */ }
-                Err(_) => {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
+                None => { tokio::time::sleep(Duration::from_millis(5)).await; }
             }
         }
     });

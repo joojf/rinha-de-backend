@@ -1,6 +1,10 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+#[derive(Debug, Serialize, Deserialize, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+pub enum ProcessorType { Default, Fallback }
+
 #[derive(Debug, Deserialize)]
 pub struct PaymentIn {
     #[serde(rename = "correlationId")]
@@ -17,7 +21,7 @@ pub struct ProcessorPayment<'a> {
     pub requested_at: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct JobPayload {
     #[serde(rename = "correlationId")]
     pub correlation_id: Uuid,

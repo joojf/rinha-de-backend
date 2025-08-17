@@ -11,12 +11,16 @@ use thiserror::Error;
 use tokio::sync::RwLock;
 use tokio::sync::Semaphore;
 use tokio::time::Instant;
+use tokio::sync::{mpsc, Mutex};
+use std::collections::VecDeque;
+use crate::models::JobPayload;
+use crate::memstore::MemStoreClient;
 
 #[derive(Clone)]
 pub struct AppState {
     pub http: Client,
-    pub redis: ConnectionManager,
-    pub redis_client: RedisClient,
+    pub redis: Option<ConnectionManager>,
+    pub redis_client: Option<RedisClient>,
     pub default_base: String,
     pub fallback_base: String,
     pub req_timeout: Duration,
@@ -32,6 +36,9 @@ pub struct AppState {
     pub admin_token: String,
     pub sem_default: Arc<Semaphore>,
     pub sem_fallback: Arc<Semaphore>,
+    pub memstore: Option<MemStoreClient>,
+    pub queue_tx: mpsc::UnboundedSender<JobPayload>,
+    pub queue_rx: Arc<Mutex<mpsc::UnboundedReceiver<JobPayload>>>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -89,25 +96,29 @@ pub async fn build_state(cfg: &Config) -> anyhow::Result<AppState> {
         .timeout(cfg.req_timeout)
         .build()?;
 
-    let client = if let Some(path) = &cfg.redis_socket {
-        let info = ConnectionInfo {
-            addr: ConnectionAddr::Unix(path.into()),
-            redis: RedisConnectionInfo {
-                db: 0,
-                username: None,
-                password: None,
-            },
-        };
-        redis::Client::open(info)?
+    let (redis_client, redis_manager) = if cfg.memstore_socket.is_some() {
+        (None, None)
     } else {
-        redis::Client::open(cfg.redis_url.clone())?
+        let client = if let Some(path) = &cfg.redis_socket {
+            let info = ConnectionInfo {
+                addr: ConnectionAddr::Unix(path.into()),
+                redis: RedisConnectionInfo { db: 0, username: None, password: None },
+            };
+            redis::Client::open(info)?
+        } else {
+            redis::Client::open(cfg.redis_url.clone())?
+        };
+        let manager = ConnectionManager::new(client.clone()).await?;
+        (Some(client), Some(manager))
     };
-    let manager = ConnectionManager::new(client.clone()).await?;
+
+    // local mpsc queue (substitui Redis para enfileiramento)
+    let (tx, rx) = mpsc::unbounded_channel::<JobPayload>();
 
     Ok(AppState {
         http,
-        redis: manager,
-        redis_client: client,
+        redis: redis_manager,
+        redis_client: redis_client,
         default_base: cfg.default_base.clone(),
         fallback_base: cfg.fallback_base.clone(),
         req_timeout: cfg.req_timeout,
@@ -123,6 +134,9 @@ pub async fn build_state(cfg: &Config) -> anyhow::Result<AppState> {
         admin_token: cfg.admin_token.clone(),
         sem_default: Arc::new(Semaphore::new(cfg.proc_concurrency)),
         sem_fallback: Arc::new(Semaphore::new(cfg.proc_concurrency)),
+        memstore: cfg.memstore_socket.clone().map(MemStoreClient::new),
+        queue_tx: tx,
+        queue_rx: Arc::new(Mutex::new(rx)),
     })
 }
 

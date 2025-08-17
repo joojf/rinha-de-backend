@@ -15,6 +15,7 @@ FROM debian:bookworm-slim AS runtime
 WORKDIR /app
 RUN useradd -ms /bin/bash appuser
 COPY --from=build /app/target/release/rinha-de-backend /usr/local/bin/app
+COPY --from=build /app/target/release/memstore /usr/local/bin/memstore
 USER appuser
 EXPOSE 9999
 ENV BIND_ADDR=0.0.0.0:9999 \
@@ -23,4 +24,3 @@ ENV BIND_ADDR=0.0.0.0:9999 \
     REDIS_URL=redis://redis:6379 \
     REQ_TIMEOUT_MS=120
 CMD ["/usr/local/bin/app"]
-

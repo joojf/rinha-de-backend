@@ -13,6 +13,7 @@ use crate::models::*;
 use crate::redis_ops::*;
 use crate::state::{AppError, AppState};
 use crate::timeutil::{format_rfc3339_millis, parse_rfc3339};
+use crate::memstore::{MsProc, MsPayload};
 
 pub fn router(state: AppState) -> Router {
     Router::new()
@@ -36,19 +37,26 @@ async fn handle_payment(
     let now_str = format_rfc3339_millis(now);
 
     // check de idempotência via set nx ex
-    let mut redis = state.redis.clone();
-    let corr_key = format!("corr:{}", input.correlation_id);
-    let set_res: bool = redis::cmd("SET")
-        .arg(&corr_key)
-        .arg("1")
-        .arg("NX")
-        .arg("EX")
-        .arg(state.idemp_ttl)
-        .query_async(&mut redis)
-        .await
-        .map_err(anyhow::Error::from)?;
-    if !set_res {
-        return Ok((StatusCode::OK, Json(serde_json::json!({"s":"dup"}))));
+    // idempotência via memstore quando disponível; fallback ao redis NX
+    if let Some(ms) = &state.memstore {
+        if let Ok(Some(_)) = ms.get(&input.correlation_id.to_string()).await {
+            return Ok((StatusCode::OK, Json(serde_json::json!({"s":"dup"}))));
+        }
+    } else if state.memstore.is_none() && state.redis.is_some() {
+        let mut redis = state.redis.clone();
+        let corr_key = format!("corr:{}", input.correlation_id);
+        let set_res: bool = redis::cmd("SET")
+            .arg(&corr_key)
+            .arg("1")
+            .arg("NX")
+            .arg("EX")
+            .arg(state.idemp_ttl)
+            .query_async(redis.as_mut().unwrap())
+            .await
+            .map_err(anyhow::Error::from)?;
+        if !set_res {
+            return Ok((StatusCode::OK, Json(serde_json::json!({"s":"dup"}))));
+        }
     }
 
     // enfileira job para processamento assíncrono
@@ -59,11 +67,7 @@ async fn handle_payment(
         attempts: 0,
         proc_name: None,
     };
-    let job_json = serde_json::to_string(&job).map_err(anyhow::Error::from)?;
-    let _: () = redis
-        .lpush(&state.queue_key, job_json)
-        .await
-        .map_err(anyhow::Error::from)?;
+    let _ = state.queue_tx.send(job);
 
     let elapsed_ms = t0.elapsed().as_millis() as u64;
     if elapsed_ms >= state.trace_slow_ms { eprintln!("SLOW /payments {}ms corr={} amt={}", elapsed_ms, input.correlation_id, input.amount); }
@@ -72,36 +76,25 @@ async fn handle_payment(
 
 // GET /payments-summary
 async fn handle_summary(
-    State(state): State<AppState>,
+    State(mut state): State<AppState>,
     Query(q): Query<SummaryQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     let t0 = Instant::now();
-    let mut redis = state.redis.clone();
     if q.from.is_none() && q.to.is_none() {
-        // caminho rápido: lê ambos totais em pipeline único
-        let mut pipe = redis::pipe();
-        pipe.get(&format!("summary:default:total_count"))
-            .get(&format!("summary:default:total_amount_cents"))
-            .get(&format!("summary:fallback:total_count"))
-            .get(&format!("summary:fallback:total_amount_cents"));
-        
-        let (def_count, def_amount, fb_count, fb_amount): (Option<i64>, Option<i64>, Option<i64>, Option<i64>) = 
-            pipe.query_async(&mut redis).await.map_err(anyhow::Error::from)?;
-        
-        let out = SummaryOut {
-            default: SummarySide {
-                total_requests: def_count.unwrap_or(0) as u64,
-                total_amount: def_amount.unwrap_or(0) as f64 / 100.0,
-            },
-            fallback: SummarySide {
-                total_requests: fb_count.unwrap_or(0) as u64,
-                total_amount: fb_amount.unwrap_or(0) as f64 / 100.0,
-            },
-        };
-        let elapsed_ms = t0.elapsed().as_millis() as u64;
-        if elapsed_ms >= state.trace_slow_ms { eprintln!("SLOW /payments-summary fast {}ms", elapsed_ms); }
-        return Ok((StatusCode::OK, Json(out)));
+        // memstore: agrega tudo; redis: caminho rápido antigo
+        if let Some(ms) = &state.memstore {
+            let mut def_cnt=0u64; let mut def_amt=0f64; let mut fb_cnt=0u64; let mut fb_amt=0f64;
+            if let Ok(all) = ms.get_all().await {
+                for (_id, p) in all {
+                    match p.proc_name { MsProc::Default => { def_cnt+=1; def_amt+=p.amount; }, MsProc::Fallback => { fb_cnt+=1; fb_amt+=p.amount; } }
+                }
+            }
+            let elapsed_ms = t0.elapsed().as_millis() as u64;
+            if elapsed_ms >= state.trace_slow_ms { eprintln!("SLOW /payments-summary mem all {}ms", elapsed_ms); }
+            return Ok((StatusCode::OK, Json(SummaryOut{ default: SummarySide{ total_requests: def_cnt, total_amount: def_amt }, fallback: SummarySide{ total_requests: fb_cnt, total_amount: fb_amt } })));
+        }
     }
+    let _redis = state.redis.clone();
 
     let from = q
         .from
@@ -116,8 +109,21 @@ async fn handle_summary(
     if to_ms < from_ms {
         return Ok((StatusCode::OK, Json(SummaryOut::default())));
     }
-    let default = sum_range(&mut redis, "default", from_ms, to_ms).await?;
-    let fallback = sum_range(&mut redis, "fallback", from_ms, to_ms).await?;
+    if let Some(ms) = &state.memstore {
+        let mut def = SummarySide::default();
+        let mut fb = SummarySide::default();
+        if let Ok(all) = ms.get_all().await {
+            for (_id, p) in all {
+                if p.requested_at_ms < from_ms || p.requested_at_ms > to_ms { continue; }
+                match p.proc_name { MsProc::Default => { def.total_requests+=1; def.total_amount+=p.amount; }, MsProc::Fallback => { fb.total_requests+=1; fb.total_amount+=p.amount; } }
+            }
+        }
+        let elapsed_ms = t0.elapsed().as_millis() as u64;
+        if elapsed_ms >= state.trace_slow_ms { eprintln!("SLOW /payments-summary mem ranged {}ms", elapsed_ms); }
+        return Ok((StatusCode::OK, Json(SummaryOut{ default: def, fallback: fb })));
+    }
+    let default = sum_range(state.redis.as_mut().unwrap(), "default", from_ms, to_ms).await?;
+    let fallback = sum_range(state.redis.as_mut().unwrap(), "fallback", from_ms, to_ms).await?;
 
     let elapsed_ms = t0.elapsed().as_millis() as u64;
     if elapsed_ms >= state.trace_slow_ms { eprintln!("SLOW /payments-summary ranged {}ms from={} to={}", elapsed_ms, q.from.as_deref().unwrap_or(""), q.to.as_deref().unwrap_or("")); }
@@ -138,20 +144,21 @@ async fn handle_admin_purge(
         return Ok((StatusCode::UNAUTHORIZED, Json(serde_json::json!({"message":"unauthorized"}))));
     }
 
-    let mut redis = state.redis.clone();
-    // limpa estruturas principais
-    let _: () = redis::pipe()
-        .del("pay:default")
-        .del("pay:fallback")
-        .del("payamtc")
-        .del("summary:default:total_count")
-        .del("summary:default:total_amount_cents")
-        .del("summary:fallback:total_count")
-        .del("summary:fallback:total_amount_cents")
-        .del(&state.queue_key)
-        .query_async(&mut redis)
-        .await
-        .map_err(anyhow::Error::from)?;
+    if let Some(mut r) = state.redis.clone() {
+        // limpa estruturas principais
+        let _: () = redis::pipe()
+            .del("pay:default")
+            .del("pay:fallback")
+            .del("payamtc")
+            .del("summary:default:total_count")
+            .del("summary:default:total_amount_cents")
+            .del("summary:fallback:total_count")
+            .del("summary:fallback:total_amount_cents")
+            .del(&state.queue_key)
+            .query_async(&mut r)
+            .await
+            .map_err(anyhow::Error::from)?;
+    }
 
     // remove chaves derivadas por padrão
     async fn scan_del(redis: &mut redis::aio::ConnectionManager, pattern: &str) -> Result<(), AppError> {
@@ -180,8 +187,13 @@ async fn handle_admin_purge(
     }
 
     // processed:* e corr:* podem ser muitos; varre com SCAN
-    scan_del(&mut redis, "processed:*").await?;
-    scan_del(&mut redis, "corr:*").await?;
+    if let Some(mut r) = state.redis.clone() {
+        scan_del(&mut r, "processed:*").await?;
+        scan_del(&mut r, "corr:*").await?;
+        scan_del(&mut r, "bucket:*").await?;
+    }
+    // limpa memstore se configurado
+    if let Some(ms) = &state.memstore { let _ = ms.purge().await; }
 
     Ok((StatusCode::OK, Json(serde_json::json!({"message":"All payments purged."}))))
 }

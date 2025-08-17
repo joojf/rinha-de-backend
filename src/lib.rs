@@ -2,6 +2,7 @@ mod background;
 mod config;
 mod models;
 mod redis_ops;
+mod memstore;
 mod routes;
 mod state;
 mod timeutil;
