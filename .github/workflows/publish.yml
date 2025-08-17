@@ -57,12 +57,13 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push (amd64)
+      - name: Build and push app (amd64)
         if: steps.meta.outputs.publish == 'true'
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
+          target: runtime-app
           push: true
           platforms: linux/amd64
           tags: |
@@ -72,3 +73,20 @@ jobs:
             org.opencontainers.image.source=${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.title=rinha-de-backend
+
+      - name: Build and push memstore (amd64)
+        if: steps.meta.outputs.publish == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          target: runtime-memstore
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ghcr.io/joojf/rinha-de-backend-memstore:${{ steps.meta.outputs.version }}
+            ghcr.io/joojf/rinha-de-backend-memstore:latest
+          labels: |
+            org.opencontainers.image.source=${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.title=rinha-de-backend-memstore

@@ -77,8 +77,7 @@ services:
           memory: "40MB"
 
   memstore:
-    image: ghcr.io/joojf/rinha-de-backend:latest
-    command: ["/usr/local/bin/memstore"]
+    image: ghcr.io/joojf/rinha-de-backend-memstore:latest
     volumes:
       - shared-sock:/tmp
     deploy:
