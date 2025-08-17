@@ -26,7 +26,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.62"
+          cpus: "0.65"
           memory: "140MB"
 
   app2:
@@ -56,7 +56,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.62"
+          cpus: "0.65"
           memory: "140MB"
 
   nginx:
@@ -77,7 +77,7 @@ services:
           memory: "40MB"
 
   memstore:
-    build: .
+    image: ghcr.io/joojf/rinha-de-backend:latest
     command: ["/usr/local/bin/memstore"]
     volumes:
       - shared-sock:/tmp
