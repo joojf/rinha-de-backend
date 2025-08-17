@@ -23,8 +23,9 @@ pub struct Config {
 impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
         let bind_addr: SocketAddr = std::env::var("BIND_ADDR")
-            .unwrap_or_else(|_| "0.0.0.0:9999".to_string())
-            .parse()?;
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| "0.0.0.0:9999".parse().expect("addr parse"));
         let default_base =
             std::env::var("DEFAULT_URL").unwrap_or_else(|_| "http://localhost:8001".to_string());
         let fallback_base =
