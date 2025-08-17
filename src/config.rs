@@ -5,8 +5,6 @@ pub struct Config {
     pub bind_addr: SocketAddr,
     pub default_base: String,
     pub fallback_base: String,
-    pub redis_url: String,
-    pub redis_socket: Option<String>,
     pub req_timeout: Duration,
     pub trace_slow_ms: u64,
     pub cb_fail_threshold: u32,
@@ -31,9 +29,6 @@ impl Config {
             std::env::var("DEFAULT_URL").unwrap_or_else(|_| "http://localhost:8001".to_string());
         let fallback_base =
             std::env::var("FALLBACK_URL").unwrap_or_else(|_| "http://localhost:8002".to_string());
-        let redis_url =
-            std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
-        let redis_socket = std::env::var("REDIS_SOCKET").ok();
         let req_timeout = std::env::var("REQ_TIMEOUT_MS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
@@ -86,8 +81,6 @@ impl Config {
             bind_addr,
             default_base,
             fallback_base,
-            redis_url,
-            redis_socket,
             req_timeout,
             trace_slow_ms,
             cb_fail_threshold,

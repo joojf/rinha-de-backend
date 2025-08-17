@@ -7,10 +7,8 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use tokio::time::Instant;
-use redis::AsyncCommands;
 
 use crate::models::*;
-use crate::redis_ops::*;
 use crate::state::{AppError, AppState};
 use crate::timeutil::{format_rfc3339_millis, parse_rfc3339};
 use crate::memstore::{MsProc, MsPayload};
@@ -36,25 +34,9 @@ async fn handle_payment(
     let now = Utc::now();
     let now_str = format_rfc3339_millis(now);
 
-    // check de idempotência via set nx ex
-    // idempotência via memstore quando disponível; fallback ao redis NX
+    // idempotência via memstore
     if let Some(ms) = &state.memstore {
         if let Ok(Some(_)) = ms.get(&input.correlation_id.to_string()).await {
-            return Ok((StatusCode::OK, Json(serde_json::json!({"s":"dup"}))));
-        }
-    } else if state.memstore.is_none() && state.redis.is_some() {
-        let mut redis = state.redis.clone();
-        let corr_key = format!("corr:{}", input.correlation_id);
-        let set_res: bool = redis::cmd("SET")
-            .arg(&corr_key)
-            .arg("1")
-            .arg("NX")
-            .arg("EX")
-            .arg(state.idemp_ttl)
-            .query_async(redis.as_mut().unwrap())
-            .await
-            .map_err(anyhow::Error::from)?;
-        if !set_res {
             return Ok((StatusCode::OK, Json(serde_json::json!({"s":"dup"}))));
         }
     }
@@ -94,8 +76,6 @@ async fn handle_summary(
             return Ok((StatusCode::OK, Json(SummaryOut{ default: SummarySide{ total_requests: def_cnt, total_amount: def_amt }, fallback: SummarySide{ total_requests: fb_cnt, total_amount: fb_amt } })));
         }
     }
-    let _redis = state.redis.clone();
-
     let from = q
         .from
         .as_deref()
@@ -122,12 +102,9 @@ async fn handle_summary(
         if elapsed_ms >= state.trace_slow_ms { eprintln!("SLOW /payments-summary mem ranged {}ms", elapsed_ms); }
         return Ok((StatusCode::OK, Json(SummaryOut{ default: def, fallback: fb })));
     }
-    let default = sum_range(state.redis.as_mut().unwrap(), "default", from_ms, to_ms).await?;
-    let fallback = sum_range(state.redis.as_mut().unwrap(), "fallback", from_ms, to_ms).await?;
-
     let elapsed_ms = t0.elapsed().as_millis() as u64;
     if elapsed_ms >= state.trace_slow_ms { eprintln!("SLOW /payments-summary ranged {}ms from={} to={}", elapsed_ms, q.from.as_deref().unwrap_or(""), q.to.as_deref().unwrap_or("")); }
-    Ok((StatusCode::OK, Json(SummaryOut { default, fallback })))
+    Ok((StatusCode::OK, Json(SummaryOut::default())))
 }
 
 // POST /admin/purge-payments
@@ -144,54 +121,6 @@ async fn handle_admin_purge(
         return Ok((StatusCode::UNAUTHORIZED, Json(serde_json::json!({"message":"unauthorized"}))));
     }
 
-    if let Some(mut r) = state.redis.clone() {
-        // limpa estruturas principais
-        let _: () = redis::pipe()
-            .del("pay:default")
-            .del("pay:fallback")
-            .del("payamtc")
-            .del("summary:default:total_count")
-            .del("summary:default:total_amount_cents")
-            .del("summary:fallback:total_count")
-            .del("summary:fallback:total_amount_cents")
-            .del(&state.queue_key)
-            .query_async(&mut r)
-            .await
-            .map_err(anyhow::Error::from)?;
-    }
-
-    // remove chaves derivadas por padrão
-    async fn scan_del(redis: &mut redis::aio::ConnectionManager, pattern: &str) -> Result<(), AppError> {
-        let mut cursor: u64 = 0;
-        loop {
-            let (next, keys): (u64, Vec<String>) = redis::cmd("SCAN")
-                .arg(cursor)
-                .arg("MATCH")
-                .arg(pattern)
-                .arg("COUNT")
-                .arg(500)
-                .query_async(redis)
-                .await
-                .map_err(anyhow::Error::from)?;
-            if !keys.is_empty() {
-                let _: () = redis::cmd("DEL")
-                    .arg(keys)
-                    .query_async(redis)
-                    .await
-                    .map_err(anyhow::Error::from)?;
-            }
-            if next == 0 { break; }
-            cursor = next;
-        }
-        Ok(())
-    }
-
-    // processed:* e corr:* podem ser muitos; varre com SCAN
-    if let Some(mut r) = state.redis.clone() {
-        scan_del(&mut r, "processed:*").await?;
-        scan_del(&mut r, "corr:*").await?;
-        scan_del(&mut r, "bucket:*").await?;
-    }
     // limpa memstore se configurado
     if let Some(ms) = &state.memstore { let _ = ms.purge().await; }
 

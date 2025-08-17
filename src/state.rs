@@ -1,11 +1,6 @@
 use std::{sync::Arc, time::Duration};
 
 use crate::config::Config;
-use redis::Client as RedisClient;
-use redis::ConnectionAddr;
-use redis::ConnectionInfo;
-use redis::RedisConnectionInfo;
-use redis::aio::ConnectionManager;
 use reqwest::Client;
 use thiserror::Error;
 use tokio::sync::RwLock;
@@ -19,8 +14,6 @@ use crate::memstore::MemStoreClient;
 #[derive(Clone)]
 pub struct AppState {
     pub http: Client,
-    pub redis: Option<ConnectionManager>,
-    pub redis_client: Option<RedisClient>,
     pub default_base: String,
     pub fallback_base: String,
     pub req_timeout: Duration,
@@ -96,29 +89,11 @@ pub async fn build_state(cfg: &Config) -> anyhow::Result<AppState> {
         .timeout(cfg.req_timeout)
         .build()?;
 
-    let (redis_client, redis_manager) = if cfg.memstore_socket.is_some() {
-        (None, None)
-    } else {
-        let client = if let Some(path) = &cfg.redis_socket {
-            let info = ConnectionInfo {
-                addr: ConnectionAddr::Unix(path.into()),
-                redis: RedisConnectionInfo { db: 0, username: None, password: None },
-            };
-            redis::Client::open(info)?
-        } else {
-            redis::Client::open(cfg.redis_url.clone())?
-        };
-        let manager = ConnectionManager::new(client.clone()).await?;
-        (Some(client), Some(manager))
-    };
-
     // local mpsc queue (substitui Redis para enfileiramento)
     let (tx, rx) = mpsc::unbounded_channel::<JobPayload>();
 
     Ok(AppState {
         http,
-        redis: redis_manager,
-        redis_client: redis_client,
         default_base: cfg.default_base.clone(),
         fallback_base: cfg.fallback_base.clone(),
         req_timeout: cfg.req_timeout,

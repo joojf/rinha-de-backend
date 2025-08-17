@@ -21,6 +21,5 @@ EXPOSE 9999
 ENV BIND_ADDR=0.0.0.0:9999 \
     DEFAULT_URL=http://payment-processor-default:8080 \
     FALLBACK_URL=http://payment-processor-fallback:8080 \
-    REDIS_URL=redis://redis:6379 \
     REQ_TIMEOUT_MS=120
 CMD ["/usr/local/bin/app"]
